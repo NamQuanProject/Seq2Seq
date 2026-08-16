@@ -93,7 +93,7 @@ def _fix_concatenation(token: str) -> list:
     return [token]
 
 
-def clean_text(s: str) -> str:
+def clean_text(s: str, stats: dict = None) -> str:
     """Rule-based denoising pipeline, applied in order:
       1. Decode HTML entities (&quot; &apos; &amp; ...) introduced by the
          noise injector, so downstream steps see real characters.
@@ -103,19 +103,76 @@ def clean_text(s: str) -> str:
          via dictionary-checked word segmentation, without touching
          genuine unrecognizable gibberish tokens.
       5. Collapse whitespace.
+
+    If `stats` (a dict) is passed, per-line counters are accumulated into
+    it in place (see `denoise_report` below) so the effect of each rule
+    can be measured over a whole corpus for the report.
     """
+    orig_len = len(s)
     s = html.unescape(s)
     s = s.lower().strip()
+
+    if stats is not None:
+        stats["elongation_collapses"] += len(_REPEAT_CHAR_RE.findall(s))
+        stats["punct_run_collapses"] += len(_MULTI_PUNCT_RE.findall(s))
+
     s = _REPEAT_CHAR_RE.sub(r"\1\1", s)          # collapse elongated chars
     s = _MULTI_PUNCT_RE.sub(r"\1", s)            # "!!!" -> "!" (before spacing)
     s = _PUNCT_SPACE_RE.sub(r" \1", s)           # split off punctuation
+
+    if stats is not None:
+        stats["disallowed_chars_stripped"] += len(_NON_ALLOWED_RE.findall(s))
+
     s = _NON_ALLOWED_RE.sub("", s)
     s = _SPACE_RE.sub(" ", s).strip()
 
     fixed_tokens = []
+    n_concat_fixes = 0
     for tok in s.split(" "):
-        fixed_tokens.extend(_fix_concatenation(tok))
+        pieces = _fix_concatenation(tok)
+        if len(pieces) > 1:
+            n_concat_fixes += 1
+        fixed_tokens.extend(pieces)
+
+    if stats is not None:
+        stats["concatenation_fixes"] += n_concat_fixes
+        stats["lines"] += 1
+        stats["chars_before"] += orig_len
+        stats["chars_after"] += len(" ".join(fixed_tokens))
+
     return " ".join(fixed_tokens)
+
+
+def denoise_report(raw_lines) -> dict:
+    """Aggregate before/after statistics of the denoising pipeline over a
+    corpus. Useful evidence for the report's data-centric analysis:
+    how much noise (elongation, punctuation runs, disallowed characters,
+    missing-space concatenations) was actually present and fixed, and how
+    much the whitespace-token vocabulary shrinks as a result (the
+    baseline `Vocabulary` in the notebook builds one entry per raw
+    whitespace token, so this directly explains part of its param blowup).
+    """
+    stats = {
+        "lines": 0,
+        "elongation_collapses": 0,
+        "punct_run_collapses": 0,
+        "disallowed_chars_stripped": 0,
+        "concatenation_fixes": 0,
+        "chars_before": 0,
+        "chars_after": 0,
+    }
+    raw_vocab, cleaned_vocab = set(), set()
+    for line in raw_lines:
+        raw_vocab.update(line.lower().split())
+        cleaned = clean_text(line, stats=stats)
+        cleaned_vocab.update(cleaned.split())
+
+    stats["raw_whitespace_vocab_size"] = len(raw_vocab)
+    stats["cleaned_whitespace_vocab_size"] = len(cleaned_vocab)
+    stats["vocab_reduction_pct"] = (
+        100.0 * (1 - len(cleaned_vocab) / max(1, len(raw_vocab)))
+    )
+    return stats
 
 
 # ---------------------------------------------------------------------------

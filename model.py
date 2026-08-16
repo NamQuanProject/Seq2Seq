@@ -1,219 +1,229 @@
 """
 model.py
 --------
-Improved Seq2Seq architecture for noisy EN->VI translation:
-  - Bidirectional GRU encoder (captures context from both directions,
-    important since noise/garbage tokens can appear anywhere in the
-    sentence and the decoder needs to learn to "look past" them).
-  - Bahdanau (additive) attention decoder: at every decode step the
-    decoder computes a weighted sum over ALL encoder states instead of
-    relying on a single fixed context vector. This directly helps with
-    noise robustness (the attention weights can learn to down-weight
-    garbage/gibberish source tokens) and gives us something to visualize
-    for the qualitative analysis.
-  - GRU instead of vanilla RNN: mitigates vanishing gradients on longer
-    noisy sentences with 3x fewer gate parameters than an LSTM.
+Compact Transformer encoder-decoder for noisy EN->VI translation.
 
-Everything is sized to respect the 5,000,000 trainable parameter budget;
-`count_parameters` should be used to verify this after construction.
+Why Transformer over the recurrent (BiGRU+attention) baseline:
+  - Self-attention lets every source position attend to every other
+    position in O(1) path length, so a single garbage/gibberish token or
+    a locally-inverted word order doesn't have to survive being carried
+    through a chain of recurrent hidden states to reach the words it
+    should influence -- the encoder can directly learn to down-weight
+    noisy tokens when building each position's representation.
+  - For a fixed parameter budget, attention layers are more
+    parameter-efficient per unit of modeling power than stacked
+    recurrent gates (no separate reset/update/candidate weight
+    matrices), so more of the 5M budget goes toward representational
+    capacity (heads/layers) instead of gating overhead.
+  - Fully parallel training over the sequence length (no sequential
+    per-timestep recurrence) is also just faster to iterate on.
+
+Parameter budget accounting (see build_model defaults, vocab=6000/side):
+  - token embeddings (src + trg):      2 * 6000 * 192   ~= 2.30M
+  - encoder stack (3 layers):                            ~= 0.81M
+  - decoder stack (3 layers):                             ~= 1.26M
+  - output projection bias:                                ~= 6.0K
+  Total                                                   ~= 4.38M  (< 5.0M budget)
+The decoder's output projection WEIGHT is tied to the target token
+embedding (standard weight tying), so it costs 0 extra parameters
+instead of another vocab*d_model matrix.
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Encoder(nn.Module):
-    def __init__(self, input_dim, emb_dim, hidden_dim, dropout=0.1):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.embedding = nn.Embedding(input_dim, emb_dim, padding_idx=0)
-        self.dropout = nn.Dropout(dropout)
-        self.rnn = nn.GRU(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
-        # Project concatenated final fwd/bwd hidden state down to decoder size.
-        self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
+class PositionalEncoding(nn.Module):
+    """Fixed sinusoidal positional encoding -- adds no trainable parameters."""
 
-    def forward(self, src, src_lens):
-        embedded = self.dropout(self.embedding(src))
-        packed = nn.utils.rnn.pack_padded_sequence(
-            embedded, src_lens.cpu(), batch_first=True, enforce_sorted=False
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # [1, max_len, d_model]
+
+    def forward(self, x):
+        return x + self.pe[:, : x.size(1)]
+
+
+class DecoderLayer(nn.Module):
+    """Custom (rather than nn.TransformerDecoderLayer) so we can pull out
+    the cross-attention weights of every layer for the qualitative
+    attention-map analysis -- the built-in module discards them."""
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
         )
-        packed_outputs, hidden = self.rnn(packed)
-        outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
-        # hidden: [2, batch, hidden_dim] (fwd, bwd) -> combine into decoder init state
-        hidden_cat = torch.cat((hidden[0], hidden[1]), dim=1)  # [batch, 2*hidden_dim]
-        hidden = torch.tanh(self.fc(hidden_cat))  # [batch, hidden_dim]
-        return outputs, hidden  # outputs: [batch, src_len, 2*hidden_dim]
-
-
-class Attention(nn.Module):
-    """Bahdanau additive attention over bidirectional encoder outputs."""
-
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.attn = nn.Linear(hidden_dim * 3, hidden_dim)
-        self.v = nn.Linear(hidden_dim, 1, bias=False)
-
-    def forward(self, decoder_hidden, encoder_outputs, mask):
-        # decoder_hidden: [batch, hidden_dim], encoder_outputs: [batch, src_len, 2*hidden_dim]
-        src_len = encoder_outputs.shape[1]
-        hidden_rep = decoder_hidden.unsqueeze(1).repeat(1, src_len, 1)
-        energy = torch.tanh(self.attn(torch.cat((hidden_rep, encoder_outputs), dim=2)))
-        scores = self.v(energy).squeeze(2)  # [batch, src_len]
-        scores = scores.masked_fill(mask == 0, -1e10)
-        return F.softmax(scores, dim=1)  # attention weights
-
-
-class Decoder(nn.Module):
-    def __init__(self, output_dim, emb_dim, hidden_dim, dropout=0.1):
-        super().__init__()
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.embedding = nn.Embedding(output_dim, emb_dim, padding_idx=0)
-        self.attention = Attention(hidden_dim)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.rnn = nn.GRU(emb_dim + hidden_dim * 2, hidden_dim, batch_first=True)
-        # Bottleneck before the vocab projection: projecting the raw
-        # concatenation (emb+hidden+context) straight to vocab_size would
-        # dominate the parameter budget (concat_dim * vocab_size params).
-        # Routing through a hidden_dim-sized bottleneck first cuts that
-        # cost roughly by (concat_dim / hidden_dim)x with negligible loss
-        # in expressiveness.
-        self.pre_out = nn.Linear(emb_dim + hidden_dim * 3, hidden_dim)
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, input, hidden, encoder_outputs, mask):
-        # input: [batch] (single decoding step)
-        input = input.unsqueeze(1)  # [batch, 1]
-        embedded = self.dropout(self.embedding(input))  # [batch, 1, emb_dim]
+    def forward(self, trg, memory, trg_mask, trg_key_padding_mask, memory_key_padding_mask):
+        sa_out, _ = self.self_attn(
+            trg, trg, trg, attn_mask=trg_mask, key_padding_mask=trg_key_padding_mask, need_weights=False,
+        )
+        trg = self.norm1(trg + self.dropout(sa_out))
 
-        attn_weights = self.attention(hidden, encoder_outputs, mask)  # [batch, src_len]
-        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)  # [batch, 1, 2*hidden_dim]
+        ca_out, ca_weights = self.cross_attn(
+            trg, memory, memory, key_padding_mask=memory_key_padding_mask,
+            need_weights=True, average_attn_weights=True,
+        )
+        trg = self.norm2(trg + self.dropout(ca_out))
 
-        rnn_input = torch.cat((embedded, context), dim=2)
-        output, hidden = self.rnn(rnn_input, hidden.unsqueeze(0))
-        hidden = hidden.squeeze(0)
-
-        embedded = embedded.squeeze(1)
-        output = output.squeeze(1)
-        context = context.squeeze(1)
-        pre_out = torch.tanh(self.pre_out(torch.cat((output, context, embedded), dim=1)))
-        prediction = self.fc_out(pre_out)
-        return prediction, hidden, attn_weights
+        ff_out = self.ff(trg)
+        trg = self.norm3(trg + self.dropout(ff_out))
+        return trg, ca_weights  # ca_weights: [batch, trg_len, src_len]
 
 
-class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device, src_pad_id=0, sos_id=2, eos_id=3):
+class Seq2SeqTransformer(nn.Module):
+    def __init__(
+        self, src_vocab_size, trg_vocab_size, device,
+        d_model=192, nhead=4, num_encoder_layers=3, num_decoder_layers=3,
+        dim_feedforward=320, dropout=0.1, max_len=64,
+        pad_id=0, sos_id=2, eos_id=3,
+    ):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
         self.device = device
-        self.src_pad_id = src_pad_id
+        self.d_model = d_model
+        self.pad_id = pad_id
         self.sos_id = sos_id
         self.eos_id = eos_id
 
-    def create_mask(self, src):
-        return (src != self.src_pad_id).to(self.device)
+        self.src_tok_emb = nn.Embedding(src_vocab_size, d_model, padding_idx=pad_id)
+        self.trg_tok_emb = nn.Embedding(trg_vocab_size, d_model, padding_idx=pad_id)
+        self.pos_enc = PositionalEncoding(d_model, max_len=max_len)
+        self.emb_dropout = nn.Dropout(dropout)
 
-    def forward(self, src, src_lens, trg, teacher_forcing_ratio=0.5):
-        batch_size, trg_len = trg.shape
-        trg_vocab_size = self.decoder.output_dim
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward, dropout, batch_first=True, activation="relu",
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_encoder_layers)
 
-        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size, device=self.device)
-        encoder_outputs, hidden = self.encoder(src, src_lens)
-        mask = self.create_mask(src)
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_decoder_layers)
+        ])
 
-        input = trg[:, 0]
-        for t in range(1, trg_len):
-            output, hidden, _ = self.decoder(input, hidden, encoder_outputs, mask)
-            outputs[:, t] = output
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            top1 = output.argmax(1)
-            input = trg[:, t] if teacher_force else top1
+        # Weight-tied output projection: reuses trg_tok_emb's weight matrix
+        # instead of learning a second (d_model x vocab) matrix from scratch.
+        self.output_bias = nn.Parameter(torch.zeros(trg_vocab_size))
+
+    def _output_proj(self, x):
+        return F.linear(x, self.trg_tok_emb.weight, self.output_bias)
+
+    @staticmethod
+    def _causal_mask(sz, device):
+        return torch.triu(torch.full((sz, sz), float("-inf"), device=device), diagonal=1)
+
+    def encode(self, src):
+        src_key_padding_mask = src == self.pad_id  # [batch, src_len]
+        x = self.emb_dropout(self.pos_enc(self.src_tok_emb(src) * math.sqrt(self.d_model)))
+        memory = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+        return memory, src_key_padding_mask
+
+    def decode_step(self, trg, memory, memory_key_padding_mask):
+        trg_key_padding_mask = trg == self.pad_id
+        trg_mask = self._causal_mask(trg.size(1), trg.device)
+        x = self.emb_dropout(self.pos_enc(self.trg_tok_emb(trg) * math.sqrt(self.d_model)))
+        attn = None
+        for layer in self.decoder_layers:
+            x, attn = layer(x, memory, trg_mask, trg_key_padding_mask, memory_key_padding_mask)
+        logits = self._output_proj(x)
+        return logits, attn
+
+    def forward(self, src, src_lens, trg, teacher_forcing_ratio=None):
+        # Transformer decoding is trained with full teacher forcing via a
+        # causal mask (standard practice: the whole target sequence is
+        # scored in one parallel pass), so teacher_forcing_ratio is
+        # accepted for interface compatibility with train.py but unused.
+        memory, memory_kpm = self.encode(src)
+        logits, _ = self.decode_step(trg[:, :-1], memory, memory_kpm)
+        # Left-pad the first output slot so downstream indexing / loss
+        # (which does output[:, 1:]) lines up with the RNN-baseline convention.
+        batch_size, _, vocab_size = logits.shape
+        outputs = torch.zeros(batch_size, trg.size(1), vocab_size, device=self.device)
+        outputs[:, 1:] = logits
         return outputs
 
     @torch.no_grad()
     def greedy_decode(self, src, src_lens, max_len=60):
         self.eval()
-        encoder_outputs, hidden = self.encoder(src, src_lens)
-        mask = self.create_mask(src)
-        batch_size = src.shape[0]
-
-        input = torch.full((batch_size,), self.sos_id, dtype=torch.long, device=self.device)
-        sequences = [[self.sos_id] for _ in range(batch_size)]
+        batch_size = src.size(0)
+        memory, memory_kpm = self.encode(src)
+        trg = torch.full((batch_size, 1), self.sos_id, dtype=torch.long, device=self.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        attentions = []
+        last_attn = None
 
         for _ in range(max_len):
-            output, hidden, attn_weights = self.decoder(input, hidden, encoder_outputs, mask)
-            attentions.append(attn_weights.detach().cpu())
-            top1 = output.argmax(1)
-            for i in range(batch_size):
-                if not finished[i]:
-                    sequences[i].append(top1[i].item())
-            finished = finished | (top1 == self.eos_id)
-            input = top1
+            logits, attn = self.decode_step(trg, memory, memory_kpm)
+            last_attn = attn  # [batch, trg_len_so_far, src_len]
+            next_tok = logits[:, -1].argmax(-1)
+            next_tok = torch.where(finished, torch.full_like(next_tok, self.pad_id), next_tok)
+            trg = torch.cat([trg, next_tok.unsqueeze(1)], dim=1)
+            finished = finished | (next_tok == self.eos_id)
             if finished.all():
                 break
-        return sequences, torch.stack(attentions, dim=1)  # [batch, trg_len, src_len]
+
+        sequences = [trg[i].tolist() for i in range(batch_size)]
+        return sequences, last_attn
 
     @torch.no_grad()
     def beam_search_decode(self, src, src_lens, max_len=60, beam_width=5, length_penalty=0.7):
-        """Batch-size-1 beam search decoding (used at inference/eval time).
-
-        Greedy decoding commits irrevocably to the argmax token at every
-        step, which for a noisy source often locks the decoder into a
-        locally-plausible but globally repetitive/wrong path. Beam search
-        keeps the top-k partial hypotheses at each step so a slightly
-        lower-probability early choice that leads to a much better full
-        sentence is not discarded prematurely.
-        """
         assert src.shape[0] == 1, "beam_search_decode expects batch_size=1"
         self.eval()
-        encoder_outputs, hidden = self.encoder(src, src_lens)
-        mask = self.create_mask(src)
+        memory, memory_kpm = self.encode(src)
 
-        # Each beam: (token_seq, hidden_state, cumulative_log_prob, finished)
-        beams = [([self.sos_id], hidden.squeeze(0) if hidden.dim() == 3 else hidden, 0.0, False)]
-
+        beams = [([self.sos_id], 0.0, False)]
         for _ in range(max_len):
-            all_candidates = []
+            candidates = []
             any_active = False
-            for seq, h, score, finished in beams:
+            for seq, score, finished in beams:
                 if finished:
-                    all_candidates.append((seq, h, score, finished))
+                    candidates.append((seq, score, finished))
                     continue
                 any_active = True
-                input = torch.tensor([seq[-1]], device=self.device)
-                output, new_hidden, _ = self.decoder(input, h.unsqueeze(0) if h.dim() == 1 else h, encoder_outputs, mask)
-                log_probs = F.log_softmax(output, dim=1).squeeze(0)  # [vocab]
+                trg = torch.tensor([seq], dtype=torch.long, device=self.device)
+                logits, _ = self.decode_step(trg, memory, memory_kpm)
+                log_probs = F.log_softmax(logits[0, -1], dim=-1)
                 topk_log_probs, topk_ids = log_probs.topk(beam_width)
                 for k in range(beam_width):
                     tok = topk_ids[k].item()
-                    new_seq = seq + [tok]
-                    new_score = score + topk_log_probs[k].item()
-                    new_finished = tok == self.eos_id
-                    all_candidates.append((new_seq, new_hidden, new_score, new_finished))
+                    candidates.append((seq + [tok], score + topk_log_probs[k].item(), tok == self.eos_id))
             if not any_active:
                 break
 
-            def norm_score(c):
-                seq, _, score, _ = c
-                # length-normalized log-prob to avoid biasing towards short sequences
-                return score / (len(seq) ** length_penalty)
-
-            all_candidates.sort(key=norm_score, reverse=True)
-            beams = all_candidates[:beam_width]
-            if all(b[3] for b in beams):
+            candidates.sort(key=lambda c: c[1] / (len(c[0]) ** length_penalty), reverse=True)
+            beams = candidates[:beam_width]
+            if all(b[2] for b in beams):
                 break
 
-        best_seq = max(beams, key=lambda c: c[2] / (len(c[0]) ** length_penalty))[0]
+        best_seq = max(beams, key=lambda c: c[1] / (len(c[0]) ** length_penalty))[0]
         return best_seq
 
 
-def build_model(src_vocab_size, trg_vocab_size, device, emb_dim=144, hidden_dim=192, dropout=0.1):
-    encoder = Encoder(src_vocab_size, emb_dim, hidden_dim, dropout=dropout)
-    decoder = Decoder(trg_vocab_size, emb_dim, hidden_dim, dropout=dropout)
-    model = Seq2Seq(encoder, decoder, device).to(device)
+def build_model(
+    src_vocab_size, trg_vocab_size, device,
+    d_model=192, nhead=4, num_encoder_layers=3, num_decoder_layers=3,
+    dim_feedforward=320, dropout=0.1, max_len=64,
+):
+    model = Seq2SeqTransformer(
+        src_vocab_size, trg_vocab_size, device,
+        d_model=d_model, nhead=nhead,
+        num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers,
+        dim_feedforward=dim_feedforward, dropout=dropout, max_len=max_len,
+    ).to(device)
     return model
 
 

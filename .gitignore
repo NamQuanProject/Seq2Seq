@@ -1,2 +1,4 @@
 en-vi-translation-data/
 __pycache__/
+output/
+.venv/

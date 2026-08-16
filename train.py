@@ -1,8 +1,9 @@
 """
 train.py
 --------
-Trains the attention Seq2Seq model, tracks train/val loss, checks the
-5,000,000 parameter budget, and saves a checkpoint + loss curve plot.
+Trains the Transformer Seq2Seq model, tracks train/val loss, checks the
+5,000,000 parameter budget, and saves a checkpoint + loss curve plot into
+./output/.
 
 Run:
     python train.py --data_dir ./en-vi-translation-data --epochs 20
@@ -57,22 +58,29 @@ def run_epoch(model, loader, optimizer, criterion, device, teacher_forcing_ratio
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="./en-vi-translation-data")
-    parser.add_argument("--tok_dir", default="./tokenizers")
+    parser.add_argument("--tok_dir", default="./output/tokenizers")
     parser.add_argument("--max_train_samples", type=int, default=30000)
     parser.add_argument("--src_vocab_size", type=int, default=6000)
     parser.add_argument("--trg_vocab_size", type=int, default=6000)
-    parser.add_argument("--emb_dim", type=int, default=144)
-    parser.add_argument("--hidden_dim", type=int, default=192)
+    parser.add_argument("--d_model", type=int, default=192)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--num_encoder_layers", type=int, default=3)
+    parser.add_argument("--num_decoder_layers", type=int, default=3)
+    parser.add_argument("--dim_feedforward", type=int, default=320)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--teacher_forcing_ratio", type=float, default=0.5)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--teacher_forcing_ratio", type=float, default=1.0)
     parser.add_argument("--max_len", type=int, default=60)
-    parser.add_argument("--ckpt_path", default="./checkpoint.pt")
-    parser.add_argument("--plot_path", default="./loss_curve.png")
+    parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--param_budget", type=int, default=5_000_000)
     args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    ckpt_path = os.path.join(args.output_dir, "checkpoint.pt")
+    plot_path = os.path.join(args.output_dir, "loss_curve.png")
 
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,15 +94,20 @@ def main():
         batch_size=args.batch_size,
         src_vocab_size=args.src_vocab_size,
         trg_vocab_size=args.trg_vocab_size,
+        stats_path=os.path.join(args.output_dir, "denoise_stats.json"),
     )
 
     model = build_model(
         bundle.src_tok.vocab_size_actual,
         bundle.trg_tok.vocab_size_actual,
         device,
-        emb_dim=args.emb_dim,
-        hidden_dim=args.hidden_dim,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
+        max_len=args.max_len + 4,
     )
 
     n_params = count_parameters(model)
@@ -102,11 +115,15 @@ def main():
     if n_params > args.param_budget:
         raise ValueError(
             f"Model has {n_params:,} params, exceeding the {args.param_budget:,} budget. "
-            "Reduce --emb_dim / --hidden_dim / vocab sizes."
+            "Reduce --d_model / --dim_feedforward / --num_encoder_layers / --num_decoder_layers / vocab sizes."
         )
 
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # Label smoothing regularizes the output distribution -- useful here
+    # because noisy source sentences make some target tokens genuinely
+    # ambiguous/uncertain, and smoothing keeps the model from becoming
+    # overconfident on those.
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
     train_losses, val_losses = [], []
@@ -128,7 +145,8 @@ def main():
         val_losses.append(val_loss)
         elapsed = time.time() - start
 
-        if val_loss < best_val_loss:
+        is_best = val_loss < best_val_loss
+        if is_best:
             best_val_loss = val_loss
             torch.save({
                 "model_state_dict": model.state_dict(),
@@ -137,10 +155,10 @@ def main():
                 "trg_vocab_size": bundle.trg_tok.vocab_size_actual,
                 "train_losses": train_losses,
                 "val_losses": val_losses,
-            }, args.ckpt_path)
+            }, ckpt_path)
 
         print(f"Epoch {epoch+1:02d}/{args.epochs} | Train Loss: {train_loss:.4f} "
-              f"| Val Loss: {val_loss:.4f} | {elapsed:.1f}s | best ckpt saved: {val_loss <= best_val_loss}")
+              f"| Val Loss: {val_loss:.4f} | {elapsed:.1f}s | best ckpt saved: {is_best}")
 
     # Plot loss curves
     plt.figure(figsize=(8, 5))
@@ -151,9 +169,9 @@ def main():
     plt.ylabel("Loss")
     plt.legend()
     plt.grid(True)
-    plt.savefig(args.plot_path, dpi=150, bbox_inches="tight")
-    print(f"Saved loss curve to {args.plot_path}")
-    print(f"Best checkpoint (val_loss={best_val_loss:.4f}) saved to {args.ckpt_path}")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    print(f"Saved loss curve to {plot_path}")
+    print(f"Best checkpoint (val_loss={best_val_loss:.4f}) saved to {ckpt_path}")
 
 
 if __name__ == "__main__":

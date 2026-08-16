@@ -9,6 +9,7 @@ This replaces the notebook baseline's whitespace `Vocabulary` (one entry
 per raw token -> vocabulary explosion on noisy text) with a shared-size
 BPE vocabulary trained only on the (cleaned) training split.
 """
+import json
 import os
 from collections import namedtuple
 
@@ -17,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from tokenizer import (
     PAD_ID, EOS_ID,
-    clean_text, build_or_load_tokenizer,
+    clean_text, build_or_load_tokenizer, denoise_report,
 )
 
 DataBundle = namedtuple(
@@ -78,13 +79,14 @@ def collate_fn(batch):
 
 def load_data(
     data_dir="./en-vi-translation-data",
-    tok_dir="./tokenizers",
+    tok_dir="./output/tokenizers",
     max_train_samples=30000,
     max_len=60,
     batch_size=64,
     src_vocab_size=6000,
     trg_vocab_size=6000,
     num_workers=0,
+    stats_path="./output/denoise_stats.json",
 ):
     train_pairs = read_parallel(
         os.path.join(data_dir, "train_noisy.en.txt"),
@@ -110,6 +112,16 @@ def load_data(
     train_pairs_clean = clean_pairs(train_pairs)
     val_pairs_clean = clean_pairs(val_pairs)
     test_pairs_clean = clean_pairs(test_pairs)
+
+    if stats_path is not None and not os.path.exists(stats_path):
+        # Measures how much noise the denoising pipeline actually fixed on
+        # the (noisy) English source side of the training split -- report
+        # material for the "Denoising & Tokenization" section.
+        stats = denoise_report(s for s, _ in train_pairs)
+        os.makedirs(os.path.dirname(stats_path) or ".", exist_ok=True)
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        print(f"Denoising stats ({stats_path}): {stats}")
 
     os.makedirs(tok_dir, exist_ok=True)
     src_tok = build_or_load_tokenizer(

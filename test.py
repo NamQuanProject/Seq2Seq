@@ -10,6 +10,7 @@ Run:
     python test.py --ckpt_path ./checkpoint.pt --data_dir ./en-vi-translation-data
 """
 import argparse
+import os
 
 import torch
 import matplotlib.pyplot as plt
@@ -78,11 +79,14 @@ def plot_attention(attn, src_tokens, trg_tokens, save_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="./en-vi-translation-data")
-    parser.add_argument("--tok_dir", default="./tokenizers")
-    parser.add_argument("--ckpt_path", default="./checkpoint.pt")
+    parser.add_argument("--tok_dir", default="./output/tokenizers")
+    parser.add_argument("--ckpt_path", default="./output/checkpoint.pt")
+    parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--max_eval_samples", type=int, default=None)
     parser.add_argument("--beam_width", type=int, default=5)
     args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.ckpt_path, map_location=device)
@@ -100,8 +104,11 @@ def main():
 
     model = build_model(
         ckpt["src_vocab_size"], ckpt["trg_vocab_size"], device,
-        emb_dim=train_args["emb_dim"], hidden_dim=train_args["hidden_dim"],
-        dropout=train_args["dropout"],
+        d_model=train_args["d_model"], nhead=train_args["nhead"],
+        num_encoder_layers=train_args["num_encoder_layers"],
+        num_decoder_layers=train_args["num_decoder_layers"],
+        dim_feedforward=train_args["dim_feedforward"],
+        dropout=train_args["dropout"], max_len=train_args["max_len"] + 4,
     )
     model.load_state_dict(ckpt["model_state_dict"])
     n_params = count_parameters(model)
@@ -151,8 +158,11 @@ def main():
         n_steps = len(pred_ids) - 1  # skip leading <sos>
         src_pieces = bundle.src_tok.tk.encode(cleaned).tokens
         trg_pieces = [bundle.trg_tok.decode_ids([t], skip_specials=False) or "?" for t in pred_ids[1 : n_steps + 1]]
-        attn_matrix = attn[0, :n_steps, : len(src_pieces)].numpy()
-        plot_attention(attn_matrix, src_pieces, trg_pieces, f"attention_example_{i+1}.png")
+        attn_matrix = attn[0, :n_steps, : len(src_pieces)].cpu().numpy()
+        plot_attention(
+            attn_matrix, src_pieces, trg_pieces,
+            os.path.join(args.output_dir, f"attention_example_{i+1}.png"),
+        )
 
 
 if __name__ == "__main__":
