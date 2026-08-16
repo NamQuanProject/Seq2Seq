@@ -90,6 +90,8 @@ def plot_attention(attn, tokens, gen_start, save_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="./en-vi-translation-data")
+    parser.add_argument("--clean_dir", default=None,
+                         help="Defaults to the clean_dir used at training time (falls back to ./output/clean_data).")
     parser.add_argument("--tok_dir", default="./output/tokenizers")
     parser.add_argument("--ckpt_path", default="./output/checkpoint.pt")
     parser.add_argument("--output_dir", default="./output")
@@ -103,8 +105,10 @@ def main():
     ckpt = torch.load(args.ckpt_path, map_location=device)
     train_args = ckpt["args"]
 
+    clean_dir = args.clean_dir or train_args.get("clean_dir", "./output/clean_data")
     bundle = load_data(
         data_dir=args.data_dir,
+        clean_dir=clean_dir,
         tok_dir=args.tok_dir,
         max_train_samples=train_args["max_train_samples"],
         max_len=train_args["max_len"],

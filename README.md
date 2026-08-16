@@ -15,17 +15,30 @@ Place the raw corpus under `./en-vi-translation-data/` with files:
 gitignored — they hold raw data / generated artifacts, not source.)
 
 ## Pipeline
-- `tokenizer.py` — rule-based denoising (missing-space repair via
-  dictionary-checked word segmentation, elongated-char / repeated-punctuation
-  collapse, disallowed-character stripping) + a single BPE subword
-  vocabulary shared across English and Vietnamese, trained only on the
-  cleaned training split. Also exposes `denoise_report(...)`, which
-  quantifies how much noise was actually fixed (counts + vocab-size
-  reduction) for the report's data-centric analysis.
-- `data.py` — reads the parallel corpus, applies `tokenizer.py`, writes
-  `output/denoise_stats.json`, and packs each pair into one sequence
-  `<sos> src_tokens <sep> trg_tokens <eos>` with loss-mask labels
-  (`load_data(...)`, `encode_pair(...)`).
+- `tokenizer.py` — rule-based denoising building blocks:
+  - `clean_text(...)` — conservative pass: elongated-char / repeated-punctuation
+    collapse, disallowed-character stripping, and dictionary-checked
+    missing-space repair ("self-correct"). Leaves unrecoverable gibberish
+    tokens in place for the model to learn to ignore.
+  - `super_clean_text(...)` — aggressive pass used by `preprocess.py`: runs
+    `clean_text` then DELETES any token that still isn't a recognizable
+    word after repair ("self-correct, then delete what can't be corrected").
+    English-source-only; never applied to the Vietnamese target.
+  - `denoise_report(...)` — quantifies how much noise was fixed (counts +
+    vocab-size reduction) for the report's data-centric analysis.
+  - a single BPE subword vocabulary shared across English and Vietnamese,
+    trained only on the cleaned training split.
+- `preprocess.py` — **run this first.** Produces a fully denoised copy of
+  the corpus at `output/clean_data/{train,val,test}_clean.{en,vi}.txt`
+  using `super_clean_text` on the English source (drops any pair that
+  becomes empty after deletion) and light normalization on the Vietnamese
+  target, plus a stats report at `output/preprocess_stats.json`.
+- `data.py` — `load_data(...)` prefers the `preprocess.py` output in
+  `clean_dir` when present; otherwise it falls back to the raw noisy files
+  with the conservative on-the-fly `clean_text` (and prints a warning
+  suggesting you run `preprocess.py`). Writes `output/denoise_stats.json`
+  and packs each pair into one sequence `<sos> src_tokens <sep>
+  trg_tokens <eos>` with loss-mask labels (`encode_pair(...)`).
 - `model.py` — `GPTTranslator`: a compact GPT-style decoder-only
   Transformer (causal self-attention blocks, weight-tied token
   embedding/output projection). Greedy and beam-search generation
@@ -39,6 +52,7 @@ gitignored — they hold raw data / generated artifacts, not source.)
 
 ## Run
 ```
+python preprocess.py --data_dir ./en-vi-translation-data --output_dir ./output/clean_data
 python train.py --data_dir ./en-vi-translation-data --epochs 20
 python test.py --ckpt_path ./output/checkpoint.pt --data_dir ./en-vi-translation-data
 ```

@@ -105,8 +105,36 @@ def collate_fn(batch):
     return ids_padded, labels_padded, sep_positions
 
 
+def _resolve_split(data_dir, clean_dir, split, raw_src_name, raw_trg_name, max_samples=None):
+    """Prefer the `preprocess.py`-produced "super clean" files
+    (`<split>_clean.en.txt` / `.vi.txt` in `clean_dir`) when they exist;
+    otherwise fall back to the raw noisy files + on-the-fly (conservative,
+    non-deleting) `clean_text`. Returns (raw_pairs, cleaned_pairs, used_preprocessed)."""
+    if clean_dir is not None:
+        clean_src = os.path.join(clean_dir, f"{split}_clean.en.txt")
+        clean_trg = os.path.join(clean_dir, f"{split}_clean.vi.txt")
+        if os.path.exists(clean_src) and os.path.exists(clean_trg):
+            cleaned_pairs = read_parallel(clean_src, clean_trg, max_samples=max_samples)
+            raw_src = os.path.join(data_dir, raw_src_name)
+            raw_trg = os.path.join(data_dir, raw_trg_name)
+            raw_pairs = (
+                read_parallel(raw_src, raw_trg, max_samples=max_samples)
+                if os.path.exists(raw_src) and os.path.exists(raw_trg)
+                else cleaned_pairs
+            )
+            return raw_pairs, cleaned_pairs, True
+
+    raw_pairs = read_parallel(
+        os.path.join(data_dir, raw_src_name), os.path.join(data_dir, raw_trg_name),
+        max_samples=max_samples,
+    )
+    cleaned_pairs = [(clean_text(s), clean_text(t)) for s, t in raw_pairs]
+    return raw_pairs, cleaned_pairs, False
+
+
 def load_data(
     data_dir="./en-vi-translation-data",
+    clean_dir="./output/clean_data",
     tok_dir="./output/tokenizers",
     max_train_samples=30000,
     max_len=128,
@@ -115,30 +143,24 @@ def load_data(
     num_workers=0,
     stats_path="./output/denoise_stats.json",
 ):
-    train_pairs = read_parallel(
-        os.path.join(data_dir, "train_noisy.en.txt"),
-        os.path.join(data_dir, "train.vi.txt"),
-        max_samples=max_train_samples,
+    train_pairs, train_pairs_clean, used_preprocessed = _resolve_split(
+        data_dir, clean_dir, "train", "train_noisy.en.txt", "train.vi.txt", max_samples=max_train_samples,
     )
-    val_pairs = read_parallel(
-        os.path.join(data_dir, "val_noisy.en.txt"),
-        os.path.join(data_dir, "val.vi.txt"),
+    val_pairs, val_pairs_clean, _ = _resolve_split(
+        data_dir, clean_dir, "val", "val_noisy.en.txt", "val.vi.txt",
     )
-    test_pairs = read_parallel(
-        os.path.join(data_dir, "test_noisy.en.txt"),
-        os.path.join(data_dir, "test.vi.txt"),
+    test_pairs, test_pairs_clean, _ = _resolve_split(
+        data_dir, clean_dir, "test", "test_noisy.en.txt", "test.vi.txt",
     )
-
-    def clean_pairs(pairs):
-        # Source is noisy English -> rule-based denoising pass.
-        # Target Vietnamese is already clean -> only normalize whitespace/case
-        # consistently through the same cleaner (no English-specific rules fire
-        # since word-segmentation only touches pure a-z ascii tokens).
-        return [(clean_text(s), clean_text(t)) for s, t in pairs]
-
-    train_pairs_clean = clean_pairs(train_pairs)
-    val_pairs_clean = clean_pairs(val_pairs)
-    test_pairs_clean = clean_pairs(test_pairs)
+    if used_preprocessed:
+        print(f"Using pre-cleaned corpus from {clean_dir} (run preprocess.py to regenerate).")
+    else:
+        print(
+            f"No pre-cleaned corpus found in {clean_dir} -- falling back to on-the-fly "
+            f"clean_text (conservative, no garbage deletion). Run "
+            f"`python preprocess.py --data_dir {data_dir} --output_dir {clean_dir}` first "
+            f"for the more aggressive self-correct/delete strategy."
+        )
 
     if stats_path is not None and not os.path.exists(stats_path):
         # Measures how much noise the denoising pipeline actually fixed on

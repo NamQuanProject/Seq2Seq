@@ -143,6 +143,51 @@ def clean_text(s: str, stats: dict = None) -> str:
     return " ".join(fixed_tokens)
 
 
+def _is_unrecoverable_garbage(tok: str) -> bool:
+    """True for a token that survived `clean_text`'s concatenation-repair
+    pass (see `_fix_concatenation`) and is STILL not a recognizable word --
+    i.e. it isn't a number, isn't punctuation, and isn't a short/common
+    token, so there is nothing left to "self-correct": it's noise, not a
+    typo. Short tokens (len<=2, e.g. 'i', 'a', 'ok', 'no') are exempted
+    since real short words are common and mostly below the frequency
+    cutoff `_is_known_word` uses for longer tokens."""
+    if not _ALPHA_RE.match(tok):
+        return False  # numbers / punctuation are never "garbage" here
+    if len(tok) <= 2:
+        return False
+    return not _is_known_word(tok)
+
+
+def super_clean_text(s: str, stats: dict = None) -> str:
+    """Aggressive denoising for the noisy English SOURCE side only:
+    1. Run the standard `clean_text` pipeline (elongation/punctuation
+       collapse, char filtering, dictionary-checked concatenation repair
+       -- i.e. "self-correct what can be self-corrected").
+    2. DELETE any token that still isn't a recognizable word after that
+       repair pass -- i.e. remove what can't be corrected, instead of
+       leaving raw gibberish in the sentence for the model to absorb.
+
+    This is intentionally more destructive than `clean_text` (which keeps
+    unrecovered noise for the BPE tokenizer/attention to learn to ignore).
+    Use this for a dedicated denoised copy of the corpus via
+    `preprocess.py`; do NOT apply it to the Vietnamese target side (already
+    clean, and Vietnamese words wouldn't pass an English frequency table).
+    """
+    cleaned = clean_text(s, stats=stats)
+    kept = []
+    n_deleted = 0
+    for tok in cleaned.split(" "):
+        if not tok:
+            continue
+        if _is_unrecoverable_garbage(tok):
+            n_deleted += 1
+            continue
+        kept.append(tok)
+    if stats is not None:
+        stats["garbage_tokens_deleted"] = stats.get("garbage_tokens_deleted", 0) + n_deleted
+    return _SPACE_RE.sub(" ", " ".join(kept)).strip()
+
+
 def denoise_report(raw_lines) -> dict:
     """Aggregate before/after statistics of the denoising pipeline over a
     corpus. Useful evidence for the report's data-centric analysis:

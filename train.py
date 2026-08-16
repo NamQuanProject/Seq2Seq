@@ -58,6 +58,7 @@ def run_epoch(model, loader, optimizer, criterion, device, train=True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="./en-vi-translation-data")
+    parser.add_argument("--clean_dir", default="./output/clean_data")
     parser.add_argument("--tok_dir", default="./output/tokenizers")
     parser.add_argument("--max_train_samples", type=int, default=30000)
     parser.add_argument("--vocab_size", type=int, default=6000)
@@ -86,6 +87,7 @@ def main():
 
     bundle = load_data(
         data_dir=args.data_dir,
+        clean_dir=args.clean_dir,
         tok_dir=args.tok_dir,
         max_train_samples=args.max_train_samples,
         max_len=args.max_len,
