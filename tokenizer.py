@@ -30,9 +30,9 @@ from wordsegment import load as _ws_load, segment as _ws_segment, UNIGRAMS as _U
 
 _ws_load()  # loads bundled unigram/bigram frequency tables (no network needed)
 
-PAD, UNK, SOS, EOS = "<pad>", "<unk>", "<sos>", "<eos>"
-SPECIAL_TOKENS = [PAD, UNK, SOS, EOS]
-PAD_ID, UNK_ID, SOS_ID, EOS_ID = 0, 1, 2, 3
+PAD, UNK, SOS, EOS, SEP = "<pad>", "<unk>", "<sos>", "<eos>", "<sep>"
+SPECIAL_TOKENS = [PAD, UNK, SOS, EOS, SEP]
+PAD_ID, UNK_ID, SOS_ID, EOS_ID, SEP_ID = 0, 1, 2, 3, 4
 
 
 # ---------------------------------------------------------------------------

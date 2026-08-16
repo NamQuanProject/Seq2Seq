@@ -1,13 +1,20 @@
 """
 data.py
 -------
-Data-centric pipeline: reads the raw noisy parallel corpus, applies the
-rule-based denoising + subword tokenization from tokenizer.py, and wraps
-everything into PyTorch Datasets/DataLoaders.
+Data-centric pipeline for a GPT-style (decoder-only) translation model.
 
-This replaces the notebook baseline's whitespace `Vocabulary` (one entry
-per raw token -> vocabulary explosion on noisy text) with a shared-size
-BPE vocabulary trained only on the (cleaned) training split.
+Instead of two separate encoder/decoder vocabularies, we train ONE shared
+BPE vocabulary over the concatenation of cleaned English + Vietnamese
+training text, and pack every example into a single sequence:
+
+    <sos> src_token ... src_token <sep> trg_token ... trg_token <eos>
+
+The model is trained as a causal language model over this sequence, with
+the loss masked to 0 on the source/prompt portion (<sos> ... <sep>) so it
+only ever has to predict the Vietnamese continuation -- exactly the
+"prefix-LM" recipe used to fine-tune GPT-like models for translation.
+This single shared stack (vs. a separate encoder + decoder) is what lets
+the model hit a much smaller parameter count for the same depth/width.
 """
 import json
 import os
@@ -17,15 +24,17 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from tokenizer import (
-    PAD_ID, EOS_ID,
+    PAD_ID, SOS_ID, EOS_ID, SEP_ID,
     clean_text, build_or_load_tokenizer, denoise_report,
 )
+
+IGNORE_INDEX = -100
 
 DataBundle = namedtuple(
     "DataBundle",
     [
         "train_loader", "val_loader", "test_loader",
-        "src_tok", "trg_tok",
+        "tok",  # single shared tokenizer
         "train_pairs", "val_pairs", "test_pairs",  # raw (uncleaned) pairs, for display
         "train_pairs_clean", "val_pairs_clean", "test_pairs_clean",
     ],
@@ -46,13 +55,33 @@ def read_parallel(src_path, trg_path, max_samples=None):
     return pairs
 
 
-class TranslationDataset(Dataset):
-    """Holds already-cleaned text pairs and encodes them lazily with BPE tokenizers."""
+def encode_pair(src_text, trg_text, tok, max_len):
+    """Pack a (src, trg) pair into one <sos> src <sep> trg <eos> sequence,
+    truncating src/trg roughly evenly so the special tokens always survive."""
+    budget = max_len - 3  # room for <sos>, <sep>, <eos>
+    src_ids = tok.encode_ids(src_text)
+    trg_ids = tok.encode_ids(trg_text)
+    if len(src_ids) + len(trg_ids) > budget:
+        half = budget // 2
+        src_ids = src_ids[:half]
+        trg_ids = trg_ids[: budget - len(src_ids)]
 
-    def __init__(self, cleaned_pairs, src_tok, trg_tok, max_len=60):
+    ids = [SOS_ID] + src_ids + [SEP_ID] + trg_ids + [EOS_ID]
+    sep_pos = 1 + len(src_ids)  # index of <sep> in `ids`
+
+    labels = list(ids)
+    for i in range(sep_pos + 1):  # <sos>, src tokens, <sep> itself: no loss
+        labels[i] = IGNORE_INDEX
+    return ids, labels, sep_pos
+
+
+class TranslationDataset(Dataset):
+    """Holds already-cleaned text pairs and packs them lazily into GPT-style
+    (ids, labels, sep_pos) triples for prefix-LM training."""
+
+    def __init__(self, cleaned_pairs, tok, max_len=128):
         self.pairs = cleaned_pairs
-        self.src_tok = src_tok
-        self.trg_tok = trg_tok
+        self.tok = tok
         self.max_len = max_len
 
     def __len__(self):
@@ -60,31 +89,29 @@ class TranslationDataset(Dataset):
 
     def __getitem__(self, idx):
         src_s, trg_s = self.pairs[idx]
-        src_ids = self.src_tok.encode_with_specials(src_s)[: self.max_len]
-        trg_ids = self.trg_tok.encode_with_specials(trg_s)[: self.max_len]
-        if src_ids[-1] != EOS_ID:
-            src_ids[-1] = EOS_ID
-        if trg_ids[-1] != EOS_ID:
-            trg_ids[-1] = EOS_ID
-        return torch.tensor(src_ids, dtype=torch.long), torch.tensor(trg_ids, dtype=torch.long)
+        ids, labels, sep_pos = encode_pair(src_s, trg_s, self.tok, self.max_len)
+        return (
+            torch.tensor(ids, dtype=torch.long),
+            torch.tensor(labels, dtype=torch.long),
+            sep_pos,
+        )
 
 
 def collate_fn(batch):
-    src_list, trg_list = zip(*batch)
-    src_lens = torch.tensor([len(s) for s in src_list], dtype=torch.long)
-    src_padded = torch.nn.utils.rnn.pad_sequence(src_list, batch_first=True, padding_value=PAD_ID)
-    trg_padded = torch.nn.utils.rnn.pad_sequence(trg_list, batch_first=True, padding_value=PAD_ID)
-    return src_padded, src_lens, trg_padded
+    ids_list, labels_list, sep_positions = zip(*batch)
+    ids_padded = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=PAD_ID)
+    labels_padded = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+    sep_positions = torch.tensor(sep_positions, dtype=torch.long)
+    return ids_padded, labels_padded, sep_positions
 
 
 def load_data(
     data_dir="./en-vi-translation-data",
     tok_dir="./output/tokenizers",
     max_train_samples=30000,
-    max_len=60,
+    max_len=128,
     batch_size=64,
-    src_vocab_size=6000,
-    trg_vocab_size=6000,
+    vocab_size=6000,
     num_workers=0,
     stats_path="./output/denoise_stats.json",
 ):
@@ -124,20 +151,18 @@ def load_data(
         print(f"Denoising stats ({stats_path}): {stats}")
 
     os.makedirs(tok_dir, exist_ok=True)
-    src_tok = build_or_load_tokenizer(
-        (s for s, _ in train_pairs_clean),
-        os.path.join(tok_dir, "src_bpe.json"),
-        vocab_size=src_vocab_size,
-    )
-    trg_tok = build_or_load_tokenizer(
-        (t for _, t in train_pairs_clean),
-        os.path.join(tok_dir, "trg_bpe.json"),
-        vocab_size=trg_vocab_size,
+    # ONE joint vocabulary shared across English and Vietnamese: this is what
+    # lets a single decoder-only stack read the source and write the target
+    # with the same embedding table (halving the embedding parameter cost
+    # relative to two separate src/trg vocabularies of the same size).
+    joint_lines = (s for pair in train_pairs_clean for s in pair)
+    tok = build_or_load_tokenizer(
+        joint_lines, os.path.join(tok_dir, "joint_bpe.json"), vocab_size=vocab_size,
     )
 
-    train_ds = TranslationDataset(train_pairs_clean, src_tok, trg_tok, max_len=max_len)
-    val_ds = TranslationDataset(val_pairs_clean, src_tok, trg_tok, max_len=max_len)
-    test_ds = TranslationDataset(test_pairs_clean, src_tok, trg_tok, max_len=max_len)
+    train_ds = TranslationDataset(train_pairs_clean, tok, max_len=max_len)
+    val_ds = TranslationDataset(val_pairs_clean, tok, max_len=max_len)
+    test_ds = TranslationDataset(test_pairs_clean, tok, max_len=max_len)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -154,7 +179,7 @@ def load_data(
 
     return DataBundle(
         train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
-        src_tok=src_tok, trg_tok=trg_tok,
+        tok=tok,
         train_pairs=train_pairs, val_pairs=val_pairs, test_pairs=test_pairs,
         train_pairs_clean=train_pairs_clean, val_pairs_clean=val_pairs_clean,
         test_pairs_clean=test_pairs_clean,
@@ -163,7 +188,7 @@ def load_data(
 
 if __name__ == "__main__":
     bundle = load_data(max_train_samples=2000)
-    print(f"src vocab: {bundle.src_tok.vocab_size_actual}, trg vocab: {bundle.trg_tok.vocab_size_actual}")
+    print(f"joint vocab: {bundle.tok.vocab_size_actual}")
     print(f"train batches: {len(bundle.train_loader)}, val batches: {len(bundle.val_loader)}")
-    src, src_lens, trg = next(iter(bundle.train_loader))
-    print("src batch shape:", src.shape, "trg batch shape:", trg.shape)
+    ids, labels, sep_pos = next(iter(bundle.train_loader))
+    print("ids batch shape:", ids.shape, "labels batch shape:", labels.shape)

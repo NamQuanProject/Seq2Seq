@@ -1,9 +1,11 @@
 """
 train.py
 --------
-Trains the Transformer Seq2Seq model, tracks train/val loss, checks the
-5,000,000 parameter budget, and saves a checkpoint + loss curve plot into
-./output/.
+Trains the GPT-style decoder-only translator as a prefix language model:
+loss is computed only on the target (Vietnamese) span of each packed
+`<sos> src <sep> trg <eos>` sequence (see data.py's `IGNORE_INDEX`
+labels). Checks the 5,000,000 parameter budget and saves a checkpoint +
+loss curve plot into ./output/.
 
 Run:
     python train.py --data_dir ./en-vi-translation-data --epochs 20
@@ -16,10 +18,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-from data import load_data
+from data import load_data, IGNORE_INDEX
 from model import build_model, count_parameters
-from tokenizer import PAD_ID
 
 
 def set_seed(seed=42):
@@ -31,21 +31,21 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
-def run_epoch(model, loader, optimizer, criterion, device, teacher_forcing_ratio, train=True):
+def run_epoch(model, loader, optimizer, criterion, device, train=True):
     model.train() if train else model.eval()
     total_loss = 0.0
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for src, src_lens, trg in loader:
-            src, trg = src.to(device), trg.to(device)
+        for ids, labels, _sep_pos in loader:
+            ids, labels = ids.to(device), labels.to(device)
             if train:
                 optimizer.zero_grad()
-            output = model(src, src_lens, trg, teacher_forcing_ratio if train else 0.0)
 
-            vocab_size = output.shape[-1]
-            output_flat = output[:, 1:].reshape(-1, vocab_size)
-            trg_flat = trg[:, 1:].reshape(-1)
-            loss = criterion(output_flat, trg_flat)
+            # Standard causal-LM shift: logits at position t (from input
+            # ids[:, :-1]) predict token t+1 (labels[:, 1:]).
+            logits, _ = model(ids[:, :-1])
+            vocab_size = logits.shape[-1]
+            loss = criterion(logits.reshape(-1, vocab_size), labels[:, 1:].reshape(-1))
 
             if train:
                 loss.backward()
@@ -60,22 +60,20 @@ def main():
     parser.add_argument("--data_dir", default="./en-vi-translation-data")
     parser.add_argument("--tok_dir", default="./output/tokenizers")
     parser.add_argument("--max_train_samples", type=int, default=30000)
-    parser.add_argument("--src_vocab_size", type=int, default=6000)
-    parser.add_argument("--trg_vocab_size", type=int, default=6000)
+    parser.add_argument("--vocab_size", type=int, default=6000)
     parser.add_argument("--d_model", type=int, default=192)
-    parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num_encoder_layers", type=int, default=3)
-    parser.add_argument("--num_decoder_layers", type=int, default=3)
-    parser.add_argument("--dim_feedforward", type=int, default=320)
+    parser.add_argument("--nhead", type=int, default=6)
+    parser.add_argument("--n_layer", type=int, default=5)
+    parser.add_argument("--d_ff", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--teacher_forcing_ratio", type=float, default=1.0)
-    parser.add_argument("--max_len", type=int, default=60)
+    parser.add_argument("--max_len", type=int, default=128)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--param_budget", type=int, default=5_000_000)
+    parser.add_argument("--bonus_param_budget", type=int, default=2_500_000)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -92,22 +90,14 @@ def main():
         max_train_samples=args.max_train_samples,
         max_len=args.max_len,
         batch_size=args.batch_size,
-        src_vocab_size=args.src_vocab_size,
-        trg_vocab_size=args.trg_vocab_size,
+        vocab_size=args.vocab_size,
         stats_path=os.path.join(args.output_dir, "denoise_stats.json"),
     )
 
     model = build_model(
-        bundle.src_tok.vocab_size_actual,
-        bundle.trg_tok.vocab_size_actual,
-        device,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_encoder_layers=args.num_encoder_layers,
-        num_decoder_layers=args.num_decoder_layers,
-        dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout,
-        max_len=args.max_len + 4,
+        bundle.tok.vocab_size_actual, device,
+        d_model=args.d_model, nhead=args.nhead, n_layer=args.n_layer,
+        d_ff=args.d_ff, dropout=args.dropout, max_len=args.max_len,
     )
 
     n_params = count_parameters(model)
@@ -115,14 +105,22 @@ def main():
     if n_params > args.param_budget:
         raise ValueError(
             f"Model has {n_params:,} params, exceeding the {args.param_budget:,} budget. "
-            "Reduce --d_model / --dim_feedforward / --num_encoder_layers / --num_decoder_layers / vocab sizes."
+            "Reduce --d_model / --d_ff / --n_layer / --vocab_size."
         )
+    if n_params <= args.bonus_param_budget:
+        margin = args.bonus_param_budget - n_params
+        print(f"Clears the bonus threshold (<={args.bonus_param_budget:,} params) "
+              f"with {margin:,} params ({100*margin/args.bonus_param_budget:.1f}%) to spare.")
+    else:
+        print(f"NOTE: {n_params:,} params exceeds the {args.bonus_param_budget:,} bonus threshold "
+              f"(still within the {args.param_budget:,} hard budget).")
 
     # Label smoothing regularizes the output distribution -- useful here
     # because noisy source sentences make some target tokens genuinely
     # ambiguous/uncertain, and smoothing keeps the model from becoming
-    # overconfident on those.
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
+    # overconfident on those. ignore_index skips the masked prefix (<sos>,
+    # source tokens, <sep>), which carries no target-side loss.
+    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, label_smoothing=args.label_smoothing)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
@@ -132,14 +130,8 @@ def main():
     print("Starting training...")
     for epoch in range(args.epochs):
         start = time.time()
-        train_loss = run_epoch(
-            model, bundle.train_loader, optimizer, criterion, device,
-            args.teacher_forcing_ratio, train=True,
-        )
-        val_loss = run_epoch(
-            model, bundle.val_loader, optimizer, criterion, device,
-            0.0, train=False,
-        )
+        train_loss = run_epoch(model, bundle.train_loader, optimizer, criterion, device, train=True)
+        val_loss = run_epoch(model, bundle.val_loader, optimizer, criterion, device, train=False)
         scheduler.step(val_loss)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -151,8 +143,7 @@ def main():
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "args": vars(args),
-                "src_vocab_size": bundle.src_tok.vocab_size_actual,
-                "trg_vocab_size": bundle.trg_tok.vocab_size_actual,
+                "vocab_size": bundle.tok.vocab_size_actual,
                 "train_losses": train_losses,
                 "val_losses": val_losses,
             }, ckpt_path)

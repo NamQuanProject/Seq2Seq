@@ -1,13 +1,13 @@
 """
 test.py
 -------
-Evaluation script: loads a trained checkpoint, reports BLEU on the noisy
-test set for both greedy and beam-search decoding, and prints a small
-qualitative analysis (with attention-map visualization) for a few
-hand-picked noisy sentences.
+Evaluation script for the GPT-style decoder-only translator: loads a
+checkpoint, reports BLEU on the noisy test set for both greedy and
+beam-search generation, and prints a qualitative analysis (with
+attention-map visualization) for a few hand-picked noisy sentences.
 
 Run:
-    python test.py --ckpt_path ./checkpoint.pt --data_dir ./en-vi-translation-data
+    python test.py --ckpt_path ./output/checkpoint.pt --data_dir ./en-vi-translation-data
 """
 import argparse
 import os
@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from tqdm import tqdm
 
-from data import load_data
+from data import load_data, encode_pair
 from model import build_model, count_parameters
-from tokenizer import clean_text
+from tokenizer import clean_text, EOS_ID
 
 
 def ids_to_words(tok, ids):
@@ -27,22 +27,28 @@ def ids_to_words(tok, ids):
 
 
 @torch.no_grad()
-def evaluate_bleu(model, loader, trg_tok, device, decode_fn, max_samples=None, max_len=60):
-    """decode_fn(model, src, src_lens) -> list[int] token ids for a single sentence."""
+def evaluate_bleu(model, loader, tok, device, generate_fn, max_samples=None, max_new_tokens=60):
+    """generate_fn(model, prompt_ids) -> list[int] full sequence (prompt + continuation)."""
     model.eval()
     refs, hyps = [], []
     n_seen = 0
-    for src, src_lens, trg in tqdm(loader, desc="Evaluating"):
-        for i in range(src.shape[0]):
+    for ids, labels, sep_pos in tqdm(loader, desc="Evaluating"):
+        for i in range(ids.shape[0]):
             if max_samples is not None and n_seen >= max_samples:
                 break
-            s = src[i : i + 1].to(device)
-            s_len = src_lens[i : i + 1]
-            pred_ids = decode_fn(model, s, s_len, max_len=max_len)
-            hyp_words = ids_to_words(trg_tok, pred_ids)
-            ref_words = ids_to_words(trg_tok, trg[i].tolist())
-            hyps.append(hyp_words)
-            refs.append([ref_words])
+            sp = sep_pos[i].item()
+            prompt = ids[i : i + 1, : sp + 1].to(device)  # <sos> src... <sep>
+            full_seq = generate_fn(model, prompt, max_new_tokens=max_new_tokens)
+            gen_ids = full_seq[sp + 1 :]
+            if EOS_ID in gen_ids:
+                gen_ids = gen_ids[: gen_ids.index(EOS_ID)]
+
+            ref_ids = [t for t in labels[i].tolist() if t != -100]
+            if ref_ids and ref_ids[-1] == EOS_ID:
+                ref_ids = ref_ids[:-1]
+
+            hyps.append(ids_to_words(tok, gen_ids))
+            refs.append([ids_to_words(tok, ref_ids)])
             n_seen += 1
         if max_samples is not None and n_seen >= max_samples:
             break
@@ -51,24 +57,29 @@ def evaluate_bleu(model, loader, trg_tok, device, decode_fn, max_samples=None, m
     return bleu, refs, hyps
 
 
-def greedy_decode_fn(model, src, src_lens, max_len=60):
-    seqs, _ = model.greedy_decode(src, src_lens, max_len=max_len)
-    return seqs[0]
+def greedy_generate_fn(model, prompt, max_new_tokens=60):
+    seq, _ = model.greedy_generate(prompt, max_new_tokens=max_new_tokens)
+    return seq
 
 
-def beam_decode_fn(model, src, src_lens, max_len=60, beam_width=5):
-    return model.beam_search_decode(src, src_lens, max_len=max_len, beam_width=beam_width)
+def beam_generate_fn(model, prompt, max_new_tokens=60, beam_width=5):
+    return model.beam_search_generate(prompt, max_new_tokens=max_new_tokens, beam_width=beam_width)
 
 
-def plot_attention(attn, src_tokens, trg_tokens, save_path):
-    fig, ax = plt.subplots(figsize=(max(6, len(src_tokens) * 0.5), max(4, len(trg_tokens) * 0.4)))
-    im = ax.imshow(attn, cmap="viridis", aspect="auto")
-    ax.set_xticks(range(len(src_tokens)))
-    ax.set_xticklabels(src_tokens, rotation=90)
-    ax.set_yticks(range(len(trg_tokens)))
-    ax.set_yticklabels(trg_tokens)
-    ax.set_xlabel("Source (noisy English)")
-    ax.set_ylabel("Predicted (Vietnamese)")
+def plot_attention(attn, tokens, gen_start, save_path):
+    """attn: full self-attention matrix [seq_len, seq_len] for the last
+    generated position's forward pass. We show each generated token's
+    attention back over the whole prompt+generation-so-far span."""
+    fig, ax = plt.subplots(figsize=(max(6, len(tokens) * 0.4), max(4, (len(tokens) - gen_start) * 0.4)))
+    sub = attn[gen_start:, :]
+    im = ax.imshow(sub, cmap="viridis", aspect="auto")
+    ax.set_xticks(range(len(tokens)))
+    ax.set_xticklabels(tokens, rotation=90)
+    ax.set_yticks(range(sub.shape[0]))
+    ax.set_yticklabels(tokens[gen_start:])
+    ax.axvline(gen_start - 0.5, color="white", lw=1, linestyle="--")
+    ax.set_xlabel("Full sequence (source span left of dashed line)")
+    ax.set_ylabel("Generated (Vietnamese) tokens")
     fig.colorbar(im, ax=ax)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
@@ -98,37 +109,35 @@ def main():
         max_train_samples=train_args["max_train_samples"],
         max_len=train_args["max_len"],
         batch_size=train_args["batch_size"],
-        src_vocab_size=train_args["src_vocab_size"],
-        trg_vocab_size=train_args["trg_vocab_size"],
+        vocab_size=train_args["vocab_size"],
     )
 
     model = build_model(
-        ckpt["src_vocab_size"], ckpt["trg_vocab_size"], device,
+        ckpt["vocab_size"], device,
         d_model=train_args["d_model"], nhead=train_args["nhead"],
-        num_encoder_layers=train_args["num_encoder_layers"],
-        num_decoder_layers=train_args["num_decoder_layers"],
-        dim_feedforward=train_args["dim_feedforward"],
-        dropout=train_args["dropout"], max_len=train_args["max_len"] + 4,
+        n_layer=train_args["n_layer"], d_ff=train_args["d_ff"],
+        dropout=train_args["dropout"], max_len=train_args["max_len"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
     n_params = count_parameters(model)
     print(f"Loaded model with {n_params:,} trainable parameters "
           f"(budget: {train_args.get('param_budget', 5_000_000):,})")
 
+    max_new_tokens = train_args["max_len"] // 2
+
     # --- Quantitative: BLEU, greedy vs beam search ---
-    max_len = train_args["max_len"]
     print("\n=== Greedy decoding ===")
     bleu_greedy, _, _ = evaluate_bleu(
-        model, bundle.test_loader, bundle.trg_tok, device,
-        greedy_decode_fn, max_samples=args.max_eval_samples, max_len=max_len,
+        model, bundle.test_loader, bundle.tok, device,
+        greedy_generate_fn, max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
     )
     print(f"Greedy BLEU on noisy test set: {bleu_greedy:.2f}")
 
     print("\n=== Beam search decoding ===")
     bleu_beam, _, _ = evaluate_bleu(
-        model, bundle.test_loader, bundle.trg_tok, device,
-        lambda m, s, sl, max_len: beam_decode_fn(m, s, sl, max_len=max_len, beam_width=args.beam_width),
-        max_samples=args.max_eval_samples, max_len=max_len,
+        model, bundle.test_loader, bundle.tok, device,
+        lambda m, p, max_new_tokens: beam_generate_fn(m, p, max_new_tokens=max_new_tokens, beam_width=args.beam_width),
+        max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
     )
     print(f"Beam search (width={args.beam_width}) BLEU on noisy test set: {bleu_beam:.2f}")
 
@@ -141,28 +150,37 @@ def main():
     ]
     for i, raw in enumerate(qual_sentences):
         cleaned = clean_text(raw)
-        src_ids = torch.tensor([bundle.src_tok.encode_with_specials(cleaned)], dtype=torch.long).to(device)
-        src_lens = torch.tensor([src_ids.shape[1]])
+        prompt_ids, _, sep_pos = encode_pair(cleaned, "", bundle.tok, train_args["max_len"])
+        prompt_ids = prompt_ids[: sep_pos + 1]  # <sos> src... <sep> (drop the empty-trg <eos>)
+        prompt = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
-        greedy_ids = greedy_decode_fn(model, src_ids, src_lens, max_len=max_len)
-        beam_ids = beam_decode_fn(model, src_ids, src_lens, max_len=max_len, beam_width=args.beam_width)
+        greedy_seq, attn = model.greedy_generate(prompt, max_new_tokens=max_new_tokens)
+        beam_seq = model.beam_search_generate(prompt, max_new_tokens=max_new_tokens, beam_width=args.beam_width)
+
+        def extract_gen(seq):
+            gen = seq[len(prompt_ids):]
+            if EOS_ID in gen:
+                gen = gen[: gen.index(EOS_ID)]
+            return gen
 
         print(f"\n--- Example {i+1} ---")
         print(f"Raw source     : {raw}")
         print(f"Cleaned source : {cleaned}")
-        print(f"Greedy pred    : {' '.join(ids_to_words(bundle.trg_tok, greedy_ids))}")
-        print(f"Beam pred      : {' '.join(ids_to_words(bundle.trg_tok, beam_ids))}")
+        print(f"Greedy pred    : {' '.join(ids_to_words(bundle.tok, extract_gen(greedy_seq)))}")
+        print(f"Beam pred      : {' '.join(ids_to_words(bundle.tok, extract_gen(beam_seq)))}")
 
-        seqs, attn = model.greedy_decode(src_ids, src_lens, max_len=max_len)
-        pred_ids = seqs[0]
-        n_steps = len(pred_ids) - 1  # skip leading <sos>
-        src_pieces = bundle.src_tok.tk.encode(cleaned).tokens
-        trg_pieces = [bundle.trg_tok.decode_ids([t], skip_specials=False) or "?" for t in pred_ids[1 : n_steps + 1]]
-        attn_matrix = attn[0, :n_steps, : len(src_pieces)].cpu().numpy()
-        plot_attention(
-            attn_matrix, src_pieces, trg_pieces,
-            os.path.join(args.output_dir, f"attention_example_{i+1}.png"),
-        )
+        if attn is not None:
+            # `attn` is the self-attention matrix from the LAST forward pass
+            # during generation, i.e. it covers positions [0, L) where L is
+            # one shorter than the final sequence (the final token is
+            # appended right after that pass) -- trim `pieces` to match.
+            attn_len = attn.shape[1]
+            pieces = [bundle.tok.decode_ids([t], skip_specials=False) or "?" for t in greedy_seq[:attn_len]]
+            attn_matrix = attn[0].cpu().numpy()
+            plot_attention(
+                attn_matrix, pieces, len(prompt_ids) - 1,
+                os.path.join(args.output_dir, f"attention_example_{i+1}.png"),
+            )
 
 
 if __name__ == "__main__":
