@@ -31,8 +31,15 @@ from wordsegment import load as _ws_load, segment as _ws_segment, UNIGRAMS as _U
 _ws_load()  # loads bundled unigram/bigram frequency tables (no network needed)
 
 PAD, UNK, SOS, EOS, SEP = "<pad>", "<unk>", "<sos>", "<eos>", "<sep>"
-SPECIAL_TOKENS = [PAD, UNK, SOS, EOS, SEP]
-PAD_ID, UNK_ID, SOS_ID, EOS_ID, SEP_ID = 0, 1, 2, 3, 4
+# Direction tags: training on BOTH <toVI> (EN->VI, the real task) and
+# <toEN> (VI->EN) examples with the same shared vocab/stack turns the one
+# model bidirectional at zero extra inference-time parameters. This is
+# what lets `rerank.py` score a candidate translation's reverse
+# probability log P(x|y) with the SAME model instead of needing a second
+# trained reverse model.
+TOEN, TOVI = "<toen>", "<tovi>"
+SPECIAL_TOKENS = [PAD, UNK, SOS, EOS, SEP, TOEN, TOVI]
+PAD_ID, UNK_ID, SOS_ID, EOS_ID, SEP_ID, TOEN_ID, TOVI_ID = 0, 1, 2, 3, 4, 5, 6
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +228,47 @@ def denoise_report(raw_lines) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 1b) Source-noise augmentation (data-centric, applied at TRAIN time only)
+# ---------------------------------------------------------------------------
+# The noise injector's own perturbations (missing spaces, garbage words,
+# elongation) are already covered by train_noisy.en.txt itself. What's
+# usually MORE valuable than a fancier decoding algorithm is simply
+# exposing the model to more of the noise distribution it'll face at test
+# time: keyboard-adjacent typos, dropped diacritics/casing, and random
+# character deletions. This is applied on top of the (already-cleaned)
+# training source at data-loading time, per epoch, so the model never
+# memorizes one fixed noisy surface form per sentence.
+_QWERTY_NEIGHBORS = {
+    "q": "wa", "w": "qes", "e": "wrd", "r": "etf", "t": "ryg", "y": "tuh",
+    "u": "yij", "i": "uok", "o": "ipl", "p": "ol", "a": "qsz", "s": "awd",
+    "d": "sfe", "f": "dgr", "g": "fht", "h": "gjy", "j": "hku", "k": "jli",
+    "l": "ko", "z": "ax", "x": "zc", "c": "xv", "v": "cb", "b": "vn", "n": "bm", "m": "n",
+}
+
+
+def augment_noise(s: str, rng, p_char: float = 0.03, p_delete: float = 0.01, p_case: float = 0.05) -> str:
+    """Randomly corrupt an already-cleaned sentence to simulate additional
+    realistic noise beyond what the injector already produced:
+      - keyboard-adjacent character swaps (typos), probability `p_char` per char
+      - random character deletion, probability `p_delete` per char
+      - random uppercasing of a character, probability `p_case` per char
+    `rng` is a `random.Random` instance (caller-owned, for reproducibility).
+    Only ever call this on the noisy ENGLISH source, and only at train time
+    -- val/test must stay exactly as given so BLEU is measured honestly.
+    """
+    out = []
+    for ch in s:
+        if ch.isalpha() and rng.random() < p_delete:
+            continue  # drop the character
+        if ch.lower() in _QWERTY_NEIGHBORS and rng.random() < p_char:
+            ch = rng.choice(_QWERTY_NEIGHBORS[ch.lower()])
+        elif ch.isalpha() and rng.random() < p_case:
+            ch = ch.upper() if ch.islower() else ch.lower()
+        out.append(ch)
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
 # 2) BPE subword tokenizer (trained on the cleaned training corpus only)
 # ---------------------------------------------------------------------------
 class SubwordTokenizer:
@@ -248,7 +296,8 @@ class SubwordTokenizer:
 
     def decode_ids(self, ids, skip_specials=True):
         if skip_specials:
-            ids = [i for i in ids if i not in (PAD_ID, SOS_ID, EOS_ID)]
+            special_ids = (PAD_ID, SOS_ID, EOS_ID, SEP_ID, TOEN_ID, TOVI_ID)
+            ids = [i for i in ids if i not in special_ids]
         return self.tk.decode(ids)
 
     @property

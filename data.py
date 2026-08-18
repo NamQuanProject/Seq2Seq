@@ -18,14 +18,15 @@ the model hit a much smaller parameter count for the same depth/width.
 """
 import json
 import os
+import random
 from collections import namedtuple
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 from tokenizer import (
-    PAD_ID, SOS_ID, EOS_ID, SEP_ID,
-    clean_text, build_or_load_tokenizer, denoise_report,
+    PAD_ID, SOS_ID, EOS_ID, SEP_ID, TOEN_ID, TOVI_ID,
+    clean_text, build_or_load_tokenizer, denoise_report, augment_noise,
 )
 
 IGNORE_INDEX = -100
@@ -55,41 +56,63 @@ def read_parallel(src_path, trg_path, max_samples=None):
     return pairs
 
 
-def encode_pair(src_text, trg_text, tok, max_len):
-    """Pack a (src, trg) pair into one <sos> src <sep> trg <eos> sequence,
-    truncating src/trg roughly evenly so the special tokens always survive."""
-    budget = max_len - 3  # room for <sos>, <sep>, <eos>
-    src_ids = tok.encode_ids(src_text)
-    trg_ids = tok.encode_ids(trg_text)
-    if len(src_ids) + len(trg_ids) > budget:
-        half = budget // 2
-        src_ids = src_ids[:half]
-        trg_ids = trg_ids[: budget - len(src_ids)]
+def encode_pair(src_text, trg_text, tok, max_len, direction="en2vi"):
+    """Pack a pair into one <sos> <toXX> a <sep> b <eos> sequence, where
+    (a, b) = (src, trg) for direction="en2vi" (the real task) or (trg, src)
+    for direction="vi2en" (reverse -- trained alongside the forward
+    direction so the SAME model can later score log P(src|trg) for
+    reranking; see rerank.py). Truncates a/b roughly evenly so the
+    special tokens always survive."""
+    tag_id = TOVI_ID if direction == "en2vi" else TOEN_ID
+    a_text, b_text = (src_text, trg_text) if direction == "en2vi" else (trg_text, src_text)
 
-    ids = [SOS_ID] + src_ids + [SEP_ID] + trg_ids + [EOS_ID]
-    sep_pos = 1 + len(src_ids)  # index of <sep> in `ids`
+    budget = max_len - 4  # room for <sos>, <toXX>, <sep>, <eos>
+    a_ids = tok.encode_ids(a_text)
+    b_ids = tok.encode_ids(b_text)
+    if len(a_ids) + len(b_ids) > budget:
+        half = budget // 2
+        a_ids = a_ids[:half]
+        b_ids = b_ids[: budget - len(a_ids)]
+
+    ids = [SOS_ID, tag_id] + a_ids + [SEP_ID] + b_ids + [EOS_ID]
+    sep_pos = 2 + len(a_ids)  # index of <sep> in `ids`
 
     labels = list(ids)
-    for i in range(sep_pos + 1):  # <sos>, src tokens, <sep> itself: no loss
+    for i in range(sep_pos + 1):  # <sos>, <toXX>, a-tokens, <sep> itself: no loss
         labels[i] = IGNORE_INDEX
     return ids, labels, sep_pos
 
 
 class TranslationDataset(Dataset):
     """Holds already-cleaned text pairs and packs them lazily into GPT-style
-    (ids, labels, sep_pos) triples for prefix-LM training."""
+    (ids, labels, sep_pos) triples for prefix-LM training.
 
-    def __init__(self, cleaned_pairs, tok, max_len=128):
+    If `p_reverse > 0`, a fraction of examples are packed in the reverse
+    (VI->EN) direction instead, making the model bidirectional (used for
+    reverse-model rescoring at inference). If `augment` is True, the
+    English source is corrupted with `tokenizer.augment_noise` BEFORE
+    packing (independently, each epoch, since re-sampled per __getitem__
+    call) -- exposes the model to noise beyond what's fixed in the file.
+    Both are meant for the TRAINING split only; leave both off for val/test
+    so evaluation is deterministic and measures the real task."""
+
+    def __init__(self, cleaned_pairs, tok, max_len=128, p_reverse=0.0, augment=False, seed=42):
         self.pairs = cleaned_pairs
         self.tok = tok
         self.max_len = max_len
+        self.p_reverse = p_reverse
+        self.augment = augment
+        self.rng = random.Random(seed)
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
         src_s, trg_s = self.pairs[idx]
-        ids, labels, sep_pos = encode_pair(src_s, trg_s, self.tok, self.max_len)
+        if self.augment:
+            src_s = augment_noise(src_s, self.rng)
+        direction = "vi2en" if (self.p_reverse > 0 and self.rng.random() < self.p_reverse) else "en2vi"
+        ids, labels, sep_pos = encode_pair(src_s, trg_s, self.tok, self.max_len, direction=direction)
         return (
             torch.tensor(ids, dtype=torch.long),
             torch.tensor(labels, dtype=torch.long),
@@ -142,6 +165,8 @@ def load_data(
     vocab_size=6000,
     num_workers=0,
     stats_path="./output/denoise_stats.json",
+    p_reverse=0.3,
+    augment_noise_p=True,
 ):
     train_pairs, train_pairs_clean, used_preprocessed = _resolve_split(
         data_dir, clean_dir, "train", "train_noisy.en.txt", "train.vi.txt", max_samples=max_train_samples,
@@ -182,7 +207,13 @@ def load_data(
         joint_lines, os.path.join(tok_dir, "joint_bpe.json"), vocab_size=vocab_size,
     )
 
-    train_ds = TranslationDataset(train_pairs_clean, tok, max_len=max_len)
+    # Bidirectional training + noise augmentation apply to TRAIN only --
+    # val/test stay deterministic (forward direction, unaugmented) so BLEU
+    # measures the real EN->VI task honestly.
+    train_ds = TranslationDataset(
+        train_pairs_clean, tok, max_len=max_len,
+        p_reverse=p_reverse, augment=augment_noise_p,
+    )
     val_ds = TranslationDataset(val_pairs_clean, tok, max_len=max_len)
     test_ds = TranslationDataset(test_pairs_clean, tok, max_len=max_len)
 

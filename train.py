@@ -75,6 +75,16 @@ def main():
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--param_budget", type=int, default=5_000_000)
     parser.add_argument("--bonus_param_budget", type=int, default=2_500_000)
+    parser.add_argument("--p_reverse", type=float, default=0.3,
+                         help="Fraction of training examples packed VI->EN instead of EN->VI, "
+                              "making the model bidirectional (enables reverse-model rescoring in rerank.py).")
+    parser.add_argument("--augment_noise", action="store_true", default=True,
+                         help="Apply tokenizer.augment_noise (typos/case/char-drop) to the English "
+                              "source at train time, resampled every epoch.")
+    parser.add_argument("--no_augment_noise", dest="augment_noise", action="store_false")
+    parser.add_argument("--save_last_k", type=int, default=3,
+                         help="Also keep a rolling window of the last K epoch checkpoints in "
+                              "output/ckpts/ for weight averaging (see average_checkpoints.py). 0 disables.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -94,6 +104,8 @@ def main():
         batch_size=args.batch_size,
         vocab_size=args.vocab_size,
         stats_path=os.path.join(args.output_dir, "denoise_stats.json"),
+        p_reverse=args.p_reverse,
+        augment_noise_p=args.augment_noise,
     )
 
     model = build_model(
@@ -126,8 +138,13 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
+    ckpts_dir = os.path.join(args.output_dir, "ckpts")
+    if args.save_last_k > 0:
+        os.makedirs(ckpts_dir, exist_ok=True)
+
     train_losses, val_losses = [], []
     best_val_loss = float("inf")
+    saved_ckpts = []
 
     print("Starting training...")
     for epoch in range(args.epochs):
@@ -139,16 +156,31 @@ def main():
         val_losses.append(val_loss)
         elapsed = time.time() - start
 
+        ckpt_payload = {
+            "model_state_dict": model.state_dict(),
+            "args": vars(args),
+            "vocab_size": bundle.tok.vocab_size_actual,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+        }
+
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "args": vars(args),
-                "vocab_size": bundle.tok.vocab_size_actual,
-                "train_losses": train_losses,
-                "val_losses": val_losses,
-            }, ckpt_path)
+            torch.save(ckpt_payload, ckpt_path)
+
+        # Rolling window of the last K epoch checkpoints, independent of
+        # whether this epoch was the single best -- weight averaging (see
+        # average_checkpoints.py) benefits from a handful of checkpoints
+        # near convergence, not just the strict single best one.
+        if args.save_last_k > 0:
+            epoch_ckpt_path = os.path.join(ckpts_dir, f"epoch_{epoch+1:03d}.pt")
+            torch.save(ckpt_payload, epoch_ckpt_path)
+            saved_ckpts.append(epoch_ckpt_path)
+            if len(saved_ckpts) > args.save_last_k:
+                stale = saved_ckpts.pop(0)
+                if os.path.exists(stale):
+                    os.remove(stale)
 
         print(f"Epoch {epoch+1:02d}/{args.epochs} | Train Loss: {train_loss:.4f} "
               f"| Val Loss: {val_loss:.4f} | {elapsed:.1f}s | best ckpt saved: {is_best}")

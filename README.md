@@ -17,12 +17,14 @@ report.
 ## 0. Repository layout
 
 ```
-tokenizer.py    # denoising rules + BPE subword tokenizer
-preprocess.py   # STEP 1 — writes a fully denoised copy of the corpus
-data.py         # loads data (raw or preprocessed) into DataLoaders
-model.py        # GPTTranslator: decoder-only Transformer, greedy/beam decoding
-train.py        # STEP 2 — trains the model, saves checkpoint + loss curve
-test.py         # STEP 3 — BLEU eval + qualitative/attention analysis
+tokenizer.py            # denoising rules, noise augmentation, BPE subword tokenizer
+preprocess.py           # STEP 1 — writes a fully denoised copy of the corpus
+data.py                 # loads data (raw or preprocessed) into DataLoaders
+model.py                # GPTTranslator: decoder-only Transformer + all decoding/scoring primitives
+train.py                # STEP 2 — trains the model, saves checkpoint(s) + loss curve
+average_checkpoints.py  # OPTIONAL — averages the last-K epoch checkpoints (SWA-style)
+rerank.py                # generate-many -> filter -> rerank inference pipeline
+test.py                 # STEP 3 — BLEU eval (greedy/beam/rerank) + qualitative/attention analysis
 requirements.txt
 exercise-machine-translation-student/
   machine_translation.ipynb   # original baseline notebook (vanilla RNN) + task spec
@@ -110,9 +112,21 @@ What it does:
 - Trains as a causal LM with the loss masked to the Vietnamese span only
   (`CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)`), with
   gradient clipping and `ReduceLROnPlateau`.
+- **Bidirectional training**: a configurable fraction (`--p_reverse`,
+  default 0.3) of training examples are packed VI→EN instead of EN→VI
+  (using `<toen>`/`<tovi>` direction tags), so the SAME model can later
+  score how well a candidate translation reverses back to the noisy
+  source — this is what powers the reverse-model term in `rerank.py`.
+- **Source-noise augmentation**: by default (`--augment_noise`, on by
+  default) the English source is further corrupted at train time
+  (keyboard-adjacent typos, dropped characters, random casing) via
+  `tokenizer.augment_noise`, resampled every epoch — usually matters more
+  for robustness than changing the decoding algorithm.
 - Saves the best (lowest val-loss) checkpoint to `output/checkpoint.pt`
   and the train/val loss curve to `output/loss_curve.png` after every
-  epoch that improves.
+  epoch that improves. Also keeps a rolling window of the last
+  `--save_last_k` (default 3) epoch checkpoints in `output/ckpts/` for
+  weight averaging (see step 2b).
 
 Useful flags (all optional, see `python train.py --help`):
 | Flag | Default | Purpose |
@@ -123,7 +137,10 @@ Useful flags (all optional, see `python train.py --help`):
 | `--d_model` / `--nhead` / `--n_layer` / `--d_ff` | 192 / 6 / 5 / 256 | model size — tune these to move the parameter count |
 | `--batch_size` | 64 | |
 | `--lr` | 3e-4 | |
-| `--max_len` | 128 | max packed sequence length (`<sos>src<sep>trg<eos>`) |
+| `--max_len` | 128 | max packed sequence length (`<sos><toXX>src<sep>trg<eos>`) |
+| `--p_reverse` | 0.3 | fraction of examples trained VI→EN (bidirectional model) |
+| `--augment_noise` / `--no_augment_noise` | on | train-time source noise augmentation |
+| `--save_last_k` | 3 | epoch checkpoints kept in `output/ckpts/` for averaging |
 | `--output_dir` | `./output` | where everything gets written |
 
 **First thing to check after training starts:** the printed line
@@ -134,6 +151,17 @@ message right after it. If you change `--d_model`/`--n_layer`/`--d_ff`/
 
 You can also just run `python model.py` for a quick parameter count
 without touching any data.
+
+### Step 2b — (optional) Checkpoint averaging
+
+```bash
+python average_checkpoints.py --ckpts_dir ./output/ckpts --output_path ./output/checkpoint_avg.pt
+```
+
+Averages the weights of the last `--save_last_k` epoch checkpoints
+(SWA-style) — a free way to often pick up a bit of BLEU without changing
+the parameter count. Evaluate it exactly like any other checkpoint:
+`python test.py --ckpt_path ./output/checkpoint_avg.pt`.
 
 ### Step 3 — Evaluate (`test.py`)
 
@@ -147,16 +175,24 @@ What it does:
 - Computes corpus BLEU-4 (with smoothing) on the noisy test set for
   **greedy** decoding, then again for **beam search** (`--beam_width`,
   default 5) — printed side by side so you can compare in the report.
+- Add `--rerank` for a third, stronger decoding strategy: generate 10-30
+  candidates (beam + low-temperature sampling), filter malformed ones,
+  and rerank with a translation-oriented score — see §4 below. This is
+  much slower per sentence, so it defaults to a 50-sentence subset
+  (`--rerank_eval_samples`, `None` = full test set).
 - Runs a qualitative pass on 3 hand-picked noisy sentences (including a
   clean vs. garbled apples example and a sentence full of slang/gibberish
-  like `"vacx"`/`"lmao"`), printing greedy vs. beam predictions and saving
-  a self-attention heatmap for each to
-  `output/attention_example_{1,2,3}.png` — look at whether the model's
-  attention on generated Vietnamese tokens is concentrated on the real
-  source words rather than the noisy/garbage ones.
+  like `"vacx"`/`"lmao"`), printing greedy vs. beam **vs. rerank**
+  predictions side by side, and saving a self-attention heatmap for each
+  to `output/attention_example_{1,2,3}.png` — look at whether the
+  model's attention on generated Vietnamese tokens is concentrated on the
+  real source words rather than the noisy/garbage ones.
 
 Useful flags: `--max_eval_samples N` to subsample the test set for a
-quick sanity check before running full BLEU; `--beam_width`.
+quick greedy/beam sanity check before running full BLEU; `--beam_width`;
+`--rerank`, `--rerank_eval_samples`, `--n_beam`, `--n_sample`,
+`--temperature`, `--alpha`, `--lambda_cov`, `--lambda_rev`,
+`--lambda_rep`, `--use_mbr` (all tune the rerank pipeline, see §4).
 
 ---
 
@@ -180,31 +216,82 @@ Everything needed for the report's plots/tables comes from this folder.
 
 ---
 
-## 4. Architecture summary (for the report)
+## 4. The rerank pipeline (`rerank.py`, `--rerank`)
+
+Beyond plain greedy/beam decoding, `rerank.py` implements a
+"generate many, then pick the best one" strategy:
+
+1. **Generate candidates**: a k-best beam search pool
+   (`model.beam_search_candidates`, `--n_beam`, default 15) plus several
+   low-temperature top-k sampling draws
+   (`model.sample_generate`, `--n_sample`, default 10, `--temperature`)
+   — beam search alone tends toward near-duplicate high-probability
+   hypotheses, sampling fills in genuinely different ones.
+2. **Filter malformed candidates** (`filter_malformed`): missing `<eos>`
+   within the generation budget, leaked special tokens, degenerate/empty
+   output, excessive repeated n-grams.
+3. **No-repeat n-gram blocking** (`no_repeat_ngram_size=3` by default) and
+   **min-length control** are applied *during* generation itself (both
+   beam and sampling), not just as a post-hoc filter.
+4. **Rerank the survivors** with:
+
+   ```
+   S(y|x) = logP(y|x)/|y|^alpha
+             + lambda_cov * C(x,y)
+             + lambda_rev * logP(x|y)
+             - lambda_rep * R(y)
+   ```
+
+   | Term | Flag | Implementation |
+   |---|---|---|
+   | length-normalized `logP(y|x)` | `--alpha` | `model.score_sequence` (teacher-forced) |
+   | coverage `C(x,y)` | `--lambda_cov` | GNMT-style penalty from the model's own self-attention over the source span (`model.coverage_vector`) — rewards attending to every source token at least once, useful when noisy input makes it easy to silently drop a word |
+   | reverse `logP(x|y)` | `--lambda_rev` | the SAME model scores the candidate translated back to English, using the `<toen>` direction tag it was trained on (`--p_reverse` in `train.py`) — no second model needed |
+   | repetition `R(y)` | `--lambda_rep` | fraction of repeated trigrams (`repetition_penalty`) |
+
+5. **Optional MBR reranking** (`--use_mbr`): instead of taking the top
+   `S(y|x)` candidate directly, pick among the top `mbr_pool` survivors
+   whichever has the highest average **chrF** similarity to the others
+   (`mbr_select`) — a self-consistency signal that avoids picking a
+   one-off decoding artifact that happened to score well.
+
+Two more BLEU-relevant strategies live outside `rerank.py` itself:
+- **Source-noise augmentation** (`tokenizer.augment_noise`, `train.py`
+  `--augment_noise`) — usually matters more than the decoding algorithm.
+- **Checkpoint averaging** (`average_checkpoints.py`) — free BLEU, zero
+  extra inference-time parameters.
+
+---
+
+## 5. Architecture summary (for the report)
 
 `model.py`'s `GPTTranslator` is a decoder-only Transformer:
 - **One** shared token embedding (joint EN/VI BPE vocab) instead of
   separate encoder/decoder vocabularies — a translation is generated by
-  continuing the sequence `<sos> src <sep>` autoregressively, i.e.
+  continuing the sequence `<sos> <tovi> src <sep>` autoregressively, i.e.
   translation is framed as "continue this sequence" rather than
-  "encode, then decode with cross-attention".
+  "encode, then decode with cross-attention". A `<toen>`/`<tovi>`
+  direction tag makes the same model bidirectional (see §4).
 - 5 pre-LN Transformer blocks (causal self-attention + MLP), weight-tied
   output projection (reuses the token embedding matrix instead of a
   second `d_model × vocab` matrix).
 - Trained with the loss masked to the target span only (prefix-LM /
   "GPT fine-tuned for translation" recipe).
-- Both **greedy** and **beam search** generation are implemented
-  (`greedy_generate`, `beam_search_generate`) to satisfy the
-  "compare decoding strategies" requirement.
+- Three decoding strategies are implemented and compared in `test.py`:
+  **greedy** (`greedy_generate`), **beam search**
+  (`beam_search_generate`/`beam_search_candidates`), and the
+  **generate-many-then-rerank** pipeline (§4) — satisfying the "compare
+  decoding strategies" requirement with more than a single alternative.
 - Self-attention lets any generated Vietnamese token attend directly back
   to any English source position (including noisy ones) — the same
-  attention-map analysis an encoder-decoder would give you.
+  attention-map analysis an encoder-decoder would give you, and also
+  what powers the coverage-penalty term in §4.
 
 Full parameter-budget math is in `model.py`'s module docstring.
 
 ---
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 - **`FileNotFoundError` on `train_noisy.en.txt`**: the raw corpus isn't
   under `--data_dir` — check step 1 of setup.
@@ -219,6 +306,13 @@ Full parameter-budget math is in `model.py`'s module docstring.
   points at the checkpoint you expect, and that `en-vi-translation-data/`
   and `output/clean_data/` haven't changed since training (the checkpoint
   pins the exact config but not the data itself).
+- **`--rerank` is slow**: expected — it runs ~25+ forward trajectories per
+  sentence instead of 1-5. Use `--rerank_eval_samples` (default 50) for
+  BLEU, and lower `--n_beam`/`--n_sample` if even that's too slow.
+- **Reverse score (`lambda_rev`) looks meaningless / near-random**: it
+  relies on the checkpoint having been trained with `--p_reverse > 0`
+  (the default). A checkpoint trained with `--p_reverse 0` never learned
+  the `<toen>` direction, so set `--lambda_rev 0` when evaluating it.
 
 ---
 
