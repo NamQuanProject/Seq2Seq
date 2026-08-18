@@ -1,11 +1,12 @@
 """
 train.py
 --------
-Trains the GPT-style decoder-only translator as a prefix language model:
-loss is computed only on the target (Vietnamese) span of each packed
-`<sos> src <sep> trg <eos>` sequence (see data.py's `IGNORE_INDEX`
-labels). Checks the 5,000,000 parameter budget and saves a checkpoint +
-loss curve plot into ./output/.
+Trains the tiny Transformer encoder-decoder translator (see model.py).
+Loss is standard cross-entropy over the decoder's target sequence
+(`<pad>` ignored) -- no prefix-masking needed since the encoder only ever
+sees the source and the decoder only ever sees/predicts the target.
+Checks the 5,000,000 parameter budget and saves a checkpoint + loss curve
+plot into ./output/.
 
 Run:
     python train.py --data_dir ./en-vi-translation-data --epochs 20
@@ -18,8 +19,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from data import load_data, IGNORE_INDEX
+from data import load_data
 from model import build_model, count_parameters
+from tokenizer import PAD_ID
 
 
 def set_seed(seed=42):
@@ -36,16 +38,14 @@ def run_epoch(model, loader, optimizer, criterion, device, train=True):
     total_loss = 0.0
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for ids, labels, _sep_pos in loader:
-            ids, labels = ids.to(device), labels.to(device)
+        for enc_ids, dec_in, dec_tgt in loader:
+            enc_ids, dec_in, dec_tgt = enc_ids.to(device), dec_in.to(device), dec_tgt.to(device)
             if train:
                 optimizer.zero_grad()
 
-            # Standard causal-LM shift: logits at position t (from input
-            # ids[:, :-1]) predict token t+1 (labels[:, 1:]).
-            logits, _ = model(ids[:, :-1])
+            logits, _ = model(enc_ids, dec_in)
             vocab_size = logits.shape[-1]
-            loss = criterion(logits.reshape(-1, vocab_size), labels[:, 1:].reshape(-1))
+            loss = criterion(logits.reshape(-1, vocab_size), dec_tgt.reshape(-1))
 
             if train:
                 loss.backward()
@@ -61,11 +61,12 @@ def main():
     parser.add_argument("--clean_dir", default="./output/clean_data")
     parser.add_argument("--tok_dir", default="./output/tokenizers")
     parser.add_argument("--max_train_samples", type=int, default=30000)
-    parser.add_argument("--vocab_size", type=int, default=6000)
-    parser.add_argument("--d_model", type=int, default=192)
-    parser.add_argument("--nhead", type=int, default=6)
-    parser.add_argument("--n_layer", type=int, default=5)
-    parser.add_argument("--d_ff", type=int, default=256)
+    parser.add_argument("--vocab_size", type=int, default=8000)
+    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--num_encoder_layers", type=int, default=3)
+    parser.add_argument("--num_decoder_layers", type=int, default=3)
+    parser.add_argument("--d_ff", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -110,8 +111,9 @@ def main():
 
     model = build_model(
         bundle.tok.vocab_size_actual, device,
-        d_model=args.d_model, nhead=args.nhead, n_layer=args.n_layer,
-        d_ff=args.d_ff, dropout=args.dropout, max_len=args.max_len,
+        d_model=args.d_model, nhead=args.nhead,
+        num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers,
+        dim_feedforward=args.d_ff, dropout=args.dropout, max_len=args.max_len,
     )
 
     n_params = count_parameters(model)
@@ -119,7 +121,7 @@ def main():
     if n_params > args.param_budget:
         raise ValueError(
             f"Model has {n_params:,} params, exceeding the {args.param_budget:,} budget. "
-            "Reduce --d_model / --d_ff / --n_layer / --vocab_size."
+            "Reduce --d_model / --d_ff / --num_encoder_layers / --num_decoder_layers / --vocab_size."
         )
     if n_params <= args.bonus_param_budget:
         margin = args.bonus_param_budget - n_params
@@ -132,9 +134,9 @@ def main():
     # Label smoothing regularizes the output distribution -- useful here
     # because noisy source sentences make some target tokens genuinely
     # ambiguous/uncertain, and smoothing keeps the model from becoming
-    # overconfident on those. ignore_index skips the masked prefix (<sos>,
-    # source tokens, <sep>), which carries no target-side loss.
-    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, label_smoothing=args.label_smoothing)
+    # overconfident on those. ignore_index skips <pad> positions in the
+    # (batched, variable-length) decoder target.
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 

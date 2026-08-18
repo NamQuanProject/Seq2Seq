@@ -1,10 +1,11 @@
 """
 test.py
 -------
-Evaluation script for the GPT-style decoder-only translator: loads a
-checkpoint, reports BLEU on the noisy test set for both greedy and
-beam-search generation, and prints a qualitative analysis (with
-attention-map visualization) for a few hand-picked noisy sentences.
+Evaluation script for the tiny Transformer encoder-decoder translator:
+loads a checkpoint, reports BLEU on the noisy test set for greedy, beam
+search, and (optionally) the generate-many-then-rerank pipeline, and
+prints a qualitative analysis (with cross-attention heatmaps) for a few
+hand-picked noisy sentences.
 
 Run:
     python test.py --ckpt_path ./output/checkpoint.pt --data_dir ./en-vi-translation-data
@@ -29,22 +30,21 @@ def ids_to_words(tok, ids):
 
 @torch.no_grad()
 def evaluate_bleu(model, loader, tok, device, generate_fn, max_samples=None, max_new_tokens=60):
-    """generate_fn(model, prompt_ids) -> list[int] full sequence (prompt + continuation)."""
+    """generate_fn(model, enc_ids) -> list[int] decoder sequence (starting with <sos>)."""
     model.eval()
     refs, hyps = [], []
     n_seen = 0
-    for ids, labels, sep_pos in tqdm(loader, desc="Evaluating"):
-        for i in range(ids.shape[0]):
+    for enc_ids, _dec_in, dec_tgt in tqdm(loader, desc="Evaluating"):
+        for i in range(enc_ids.shape[0]):
             if max_samples is not None and n_seen >= max_samples:
                 break
-            sp = sep_pos[i].item()
-            prompt = ids[i : i + 1, : sp + 1].to(device)  # <sos> src... <sep>
-            full_seq = generate_fn(model, prompt, max_new_tokens=max_new_tokens)
-            gen_ids = full_seq[sp + 1 :]
+            enc = enc_ids[i : i + 1].to(device)
+            dec_seq = generate_fn(model, enc, max_new_tokens=max_new_tokens)
+            gen_ids = dec_seq[1:]
             if EOS_ID in gen_ids:
                 gen_ids = gen_ids[: gen_ids.index(EOS_ID)]
 
-            ref_ids = [t for t in labels[i].tolist() if t != -100]
+            ref_ids = [t for t in dec_tgt[i].tolist() if t != 0]  # 0 = <pad>
             if ref_ids and ref_ids[-1] == EOS_ID:
                 ref_ids = ref_ids[:-1]
 
@@ -58,13 +58,13 @@ def evaluate_bleu(model, loader, tok, device, generate_fn, max_samples=None, max
     return bleu, refs, hyps
 
 
-def greedy_generate_fn(model, prompt, max_new_tokens=60):
-    seq, _ = model.greedy_generate(prompt, max_new_tokens=max_new_tokens)
+def greedy_generate_fn(model, enc_ids, max_new_tokens=60):
+    seq, _ = model.greedy_generate(enc_ids, max_new_tokens=max_new_tokens)
     return seq
 
 
-def beam_generate_fn(model, prompt, max_new_tokens=60, beam_width=5):
-    return model.beam_search_generate(prompt, max_new_tokens=max_new_tokens, beam_width=beam_width)
+def beam_generate_fn(model, enc_ids, max_new_tokens=60, beam_width=5):
+    return model.beam_search_generate(enc_ids, max_new_tokens=max_new_tokens, beam_width=beam_width)
 
 
 @torch.no_grad()
@@ -86,20 +86,18 @@ def evaluate_bleu_rerank(model, tok, pairs, device, max_len, max_samples=None, *
     return bleu
 
 
-def plot_attention(attn, tokens, gen_start, save_path):
-    """attn: full self-attention matrix [seq_len, seq_len] for the last
-    generated position's forward pass. We show each generated token's
-    attention back over the whole prompt+generation-so-far span."""
-    fig, ax = plt.subplots(figsize=(max(6, len(tokens) * 0.4), max(4, (len(tokens) - gen_start) * 0.4)))
-    sub = attn[gen_start:, :]
-    im = ax.imshow(sub, cmap="viridis", aspect="auto")
-    ax.set_xticks(range(len(tokens)))
-    ax.set_xticklabels(tokens, rotation=90)
-    ax.set_yticks(range(sub.shape[0]))
-    ax.set_yticklabels(tokens[gen_start:])
-    ax.axvline(gen_start - 0.5, color="white", lw=1, linestyle="--")
-    ax.set_xlabel("Full sequence (source span left of dashed line)")
-    ax.set_ylabel("Generated (Vietnamese) tokens")
+def plot_attention(attn, src_tokens, trg_tokens, save_path):
+    """attn: cross-attention matrix [trg_len, src_len] -- for each
+    generated Vietnamese token (row), how much weight the decoder placed
+    on each English source token (column)."""
+    fig, ax = plt.subplots(figsize=(max(6, len(src_tokens) * 0.5), max(4, len(trg_tokens) * 0.4)))
+    im = ax.imshow(attn, cmap="viridis", aspect="auto")
+    ax.set_xticks(range(len(src_tokens)))
+    ax.set_xticklabels(src_tokens, rotation=90)
+    ax.set_yticks(range(len(trg_tokens)))
+    ax.set_yticklabels(trg_tokens)
+    ax.set_xlabel("Source (noisy English)")
+    ax.set_ylabel("Predicted (Vietnamese)")
     fig.colorbar(im, ax=ax)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
@@ -153,7 +151,9 @@ def main():
     model = build_model(
         ckpt["vocab_size"], device,
         d_model=train_args["d_model"], nhead=train_args["nhead"],
-        n_layer=train_args["n_layer"], d_ff=train_args["d_ff"],
+        num_encoder_layers=train_args["num_encoder_layers"],
+        num_decoder_layers=train_args["num_decoder_layers"],
+        dim_feedforward=train_args["d_ff"],
         dropout=train_args["dropout"], max_len=train_args["max_len"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
@@ -174,7 +174,7 @@ def main():
     print("\n=== Beam search decoding ===")
     bleu_beam, _, _ = evaluate_bleu(
         model, bundle.test_loader, bundle.tok, device,
-        lambda m, p, max_new_tokens: beam_generate_fn(m, p, max_new_tokens=max_new_tokens, beam_width=args.beam_width),
+        lambda m, e, max_new_tokens: beam_generate_fn(m, e, max_new_tokens=max_new_tokens, beam_width=args.beam_width),
         max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
     )
     print(f"Beam search (width={args.beam_width}) BLEU on noisy test set: {bleu_beam:.2f}")
@@ -203,15 +203,14 @@ def main():
     ]
     for i, raw in enumerate(qual_sentences):
         cleaned = clean_text(raw)
-        prompt_ids, _, sep_pos = encode_pair(cleaned, "", bundle.tok, train_args["max_len"])
-        prompt_ids = prompt_ids[: sep_pos + 1]  # <sos> src... <sep> (drop the empty-trg <eos>)
-        prompt = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        encoder_ids, _, _ = encode_pair(cleaned, "", bundle.tok, train_args["max_len"])
+        enc_tensor = torch.tensor([encoder_ids], dtype=torch.long, device=device)
 
-        greedy_seq, attn = model.greedy_generate(prompt, max_new_tokens=max_new_tokens)
-        beam_seq = model.beam_search_generate(prompt, max_new_tokens=max_new_tokens, beam_width=args.beam_width)
+        greedy_seq, attn = model.greedy_generate(enc_tensor, max_new_tokens=max_new_tokens)
+        beam_seq = model.beam_search_generate(enc_tensor, max_new_tokens=max_new_tokens, beam_width=args.beam_width)
 
         def extract_gen(seq):
-            gen = seq[len(prompt_ids):]
+            gen = seq[1:]
             if EOS_ID in gen:
                 gen = gen[: gen.index(EOS_ID)]
             return gen
@@ -230,15 +229,16 @@ def main():
               f"{len(dropped)} malformed candidates dropped)")
 
         if attn is not None:
-            # `attn` is the self-attention matrix from the LAST forward pass
-            # during generation, i.e. it covers positions [0, L) where L is
-            # one shorter than the final sequence (the final token is
-            # appended right after that pass) -- trim `pieces` to match.
-            attn_len = attn.shape[1]
-            pieces = [bundle.tok.decode_ids([t], skip_specials=False) or "?" for t in greedy_seq[:attn_len]]
-            attn_matrix = attn[0].cpu().numpy()
+            # `attn` is the LAST decode step's cross-attention, i.e. it
+            # covers decoder positions [0, L) where L is one shorter than
+            # the final greedy sequence (the final token is appended right
+            # after that pass) -- trim the target-side pieces to match.
+            trg_len = attn.shape[1]
+            src_pieces = [bundle.tok.decode_ids([t], skip_specials=False) or "?" for t in encoder_ids[2:-1]]
+            trg_pieces = [bundle.tok.decode_ids([t], skip_specials=False) or "?" for t in greedy_seq[1 : trg_len + 1]]
+            attn_matrix = attn[0, :, 2:-1].cpu().numpy()  # drop <sos>/<toXX>/<eos> source columns
             plot_attention(
-                attn_matrix, pieces, len(prompt_ids) - 1,
+                attn_matrix, src_pieces, trg_pieces,
                 os.path.join(args.output_dir, f"attention_example_{i+1}.png"),
             )
 

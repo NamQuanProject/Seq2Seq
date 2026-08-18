@@ -3,10 +3,21 @@
 Noisy English → clean Vietnamese translation. The source English text has
 injected noise (missing spaces, garbage/gibberish words, elongated
 characters, inverted grammar); the Vietnamese target is clean. The model
-is a **GPT-small-style decoder-only Transformer** trained as a prefix
-language model, sized to land around **~2.2–2.4M trainable parameters**
-— comfortably under the assignment's 5,000,000 hard cap and inside the
-2,500,000 bonus tier.
+is a **tiny Transformer encoder-decoder**, sized to land around
+**~2.4M trainable parameters** — comfortably under the assignment's
+5,000,000 hard cap and inside the 2,500,000 bonus tier:
+
+| Component | Value |
+|---|---|
+| Encoder layers | 3 |
+| Decoder layers | 3 |
+| Model dimension | 128 |
+| Attention heads | 4 |
+| FFN dimension | 512 |
+| Vocabulary | 8,000 joint BPE tokens (shared EN+VI) |
+| Embeddings | shared across encoder input, decoder input, and output projection |
+| Position encoding | sinusoidal (0 extra parameters) |
+| Dropout | 0.1 |
 
 This README walks through the whole pipeline, start to end: setup, data
 placement, running each script in order, and what to look at for the
@@ -20,7 +31,7 @@ report.
 tokenizer.py            # denoising rules, noise augmentation, BPE subword tokenizer
 preprocess.py           # STEP 1 — writes a fully denoised copy of the corpus
 data.py                 # loads data (raw or preprocessed) into DataLoaders
-model.py                # GPTTranslator: decoder-only Transformer + all decoding/scoring primitives
+model.py                # Seq2SeqTransformer: encoder-decoder + all decoding/scoring primitives
 train.py                # STEP 2 — trains the model, saves checkpoint(s) + loss curve
 average_checkpoints.py  # OPTIONAL — averages the last-K epoch checkpoints (SWA-style)
 rerank.py                # generate-many -> filter -> rerank inference pipeline
@@ -102,21 +113,25 @@ python train.py --data_dir ./en-vi-translation-data --epochs 20
 
 What it does:
 - Loads `output/clean_data/` if present (else raw + on-the-fly clean).
-- Trains **one shared BPE vocabulary** (default 6000 tokens) over the
-  concatenation of cleaned English + Vietnamese training text, and packs
-  every pair into a single sequence `<sos> src_tokens <sep> trg_tokens
-  <eos>` (`output/tokenizers/joint_bpe.json`).
+- Trains **one shared BPE vocabulary** (default 8000 tokens) over the
+  concatenation of cleaned English + Vietnamese training text
+  (`output/tokenizers/joint_bpe.json`), used by both the encoder and
+  decoder (see the architecture table above).
+- Packs each pair as `encoder_ids = <sos> <toXX> src... <eos>` /
+  `decoder_input = <sos> trg...` / `decoder_target = trg... <eos>` — a
+  leading direction tag (`<tovi>`/`<toen>`) tells the shared
+  encoder+decoder which way to translate (see bidirectional training below).
 - Builds the model (`build_model`), prints the trainable parameter count,
   and **raises an error if it exceeds 5,000,000** (hard budget) — it also
   reports whether it clears the 2,500,000 bonus threshold.
-- Trains as a causal LM with the loss masked to the Vietnamese span only
-  (`CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)`), with
-  gradient clipping and `ReduceLROnPlateau`.
+- Trains with standard cross-entropy over the decoder target
+  (`CrossEntropyLoss(ignore_index=<pad>, label_smoothing=0.1)`), gradient
+  clipping, and `ReduceLROnPlateau`.
 - **Bidirectional training**: a configurable fraction (`--p_reverse`,
-  default 0.3) of training examples are packed VI→EN instead of EN→VI
-  (using `<toen>`/`<tovi>` direction tags), so the SAME model can later
-  score how well a candidate translation reverses back to the noisy
-  source — this is what powers the reverse-model term in `rerank.py`.
+  default 0.3) of training examples are packed VI→EN instead of EN→VI, so
+  the SAME encoder+decoder pair can later score how well a candidate
+  translation reverses back to the noisy source — this is what powers the
+  reverse-model term in `rerank.py`.
 - **Source-noise augmentation**: by default (`--augment_noise`, on by
   default) the English source is further corrupted at train time
   (keyboard-adjacent typos, dropped characters, random casing) via
@@ -133,11 +148,13 @@ Useful flags (all optional, see `python train.py --help`):
 |---|---|---|
 | `--epochs` | 20 | training epochs |
 | `--max_train_samples` | 30000 | cap on training pairs (speed knob) |
-| `--vocab_size` | 6000 | shared BPE vocab size |
-| `--d_model` / `--nhead` / `--n_layer` / `--d_ff` | 192 / 6 / 5 / 256 | model size — tune these to move the parameter count |
+| `--vocab_size` | 8000 | shared BPE vocab size |
+| `--d_model` / `--nhead` | 128 / 4 | model width / attention heads |
+| `--num_encoder_layers` / `--num_decoder_layers` | 3 / 3 | depth — tune these (and `--d_model`/`--d_ff`) to move the parameter count |
+| `--d_ff` | 512 | feedforward dimension |
 | `--batch_size` | 64 | |
 | `--lr` | 3e-4 | |
-| `--max_len` | 128 | max packed sequence length (`<sos><toXX>src<sep>trg<eos>`) |
+| `--max_len` | 128 | max encoder/decoder sequence length |
 | `--p_reverse` | 0.3 | fraction of examples trained VI→EN (bidirectional model) |
 | `--augment_noise` / `--no_augment_noise` | on | train-time source noise augmentation |
 | `--save_last_k` | 3 | epoch checkpoints kept in `output/ckpts/` for averaging |
@@ -145,9 +162,10 @@ Useful flags (all optional, see `python train.py --help`):
 
 **First thing to check after training starts:** the printed line
 `Trainable parameters: N,NNN,NNN (budget: 5,000,000)` and the bonus-tier
-message right after it. If you change `--d_model`/`--n_layer`/`--d_ff`/
-`--vocab_size`, re-run and re-check this before doing a full training run
-— it fails fast (raises before training starts) if you exceed 5M.
+message right after it. If you change `--d_model`/`--num_encoder_layers`/
+`--num_decoder_layers`/`--d_ff`/`--vocab_size`, re-run and re-check this
+before doing a full training run — it fails fast (raises before training
+starts) if you exceed 5M.
 
 You can also just run `python model.py` for a quick parameter count
 without touching any data.
@@ -183,10 +201,11 @@ What it does:
 - Runs a qualitative pass on 3 hand-picked noisy sentences (including a
   clean vs. garbled apples example and a sentence full of slang/gibberish
   like `"vacx"`/`"lmao"`), printing greedy vs. beam **vs. rerank**
-  predictions side by side, and saving a self-attention heatmap for each
-  to `output/attention_example_{1,2,3}.png` — look at whether the
-  model's attention on generated Vietnamese tokens is concentrated on the
-  real source words rather than the noisy/garbage ones.
+  predictions side by side, and saving a **cross-attention** heatmap for
+  each to `output/attention_example_{1,2,3}.png` (decoder positions ×
+  source positions) — look at whether the model's attention on generated
+  Vietnamese tokens is concentrated on the real source words rather than
+  the noisy/garbage ones.
 
 Useful flags: `--max_eval_samples N` to subsample the test set for a
 quick greedy/beam sanity check before running full BLEU; `--beam_width`;
@@ -208,8 +227,9 @@ output/
   tokenizers/joint_bpe.json      # shared BPE vocabulary
   denoise_stats.json             # clean_text-level stats (conservative pass)
   checkpoint.pt                  # best model weights + full config + loss history
+  ckpts/epoch_*.pt               # rolling checkpoints for averaging
   loss_curve.png                 # train/val loss vs. epoch
-  attention_example_1.png ...3   # attention heatmaps for the qualitative analysis
+  attention_example_1.png ...3   # cross-attention heatmaps for the qualitative analysis
 ```
 
 Everything needed for the report's plots/tables comes from this folder.
@@ -226,7 +246,9 @@ Beyond plain greedy/beam decoding, `rerank.py` implements a
    low-temperature top-k sampling draws
    (`model.sample_generate`, `--n_sample`, default 10, `--temperature`)
    — beam search alone tends toward near-duplicate high-probability
-   hypotheses, sampling fills in genuinely different ones.
+   hypotheses, sampling fills in genuinely different ones. The encoder
+   runs ONCE per source sentence and its output is reused across every
+   candidate.
 2. **Filter malformed candidates** (`filter_malformed`): missing `<eos>`
    within the generation budget, leaked special tokens, degenerate/empty
    output, excessive repeated n-grams.
@@ -245,8 +267,8 @@ Beyond plain greedy/beam decoding, `rerank.py` implements a
    | Term | Flag | Implementation |
    |---|---|---|
    | length-normalized `logP(y|x)` | `--alpha` | `model.score_sequence` (teacher-forced) |
-   | coverage `C(x,y)` | `--lambda_cov` | GNMT-style penalty from the model's own self-attention over the source span (`model.coverage_vector`) — rewards attending to every source token at least once, useful when noisy input makes it easy to silently drop a word |
-   | reverse `logP(x|y)` | `--lambda_rev` | the SAME model scores the candidate translated back to English, using the `<toen>` direction tag it was trained on (`--p_reverse` in `train.py`) — no second model needed |
+   | coverage `C(x,y)` | `--lambda_cov` | GNMT-style penalty from the decoder's own cross-attention into the encoder (`model.coverage_vector`) — rewards attending to every source token at least once, useful when noisy input makes it easy to silently drop a word |
+   | reverse `logP(x|y)` | `--lambda_rev` | the SAME encoder+decoder scores the candidate translated back to English, using the `<toen>` direction tag it was trained on (`--p_reverse` in `train.py`) — no second model needed |
    | repetition `R(y)` | `--lambda_rep` | fraction of repeated trigrams (`repetition_penalty`) |
 
 5. **Optional MBR reranking** (`--use_mbr`): instead of taking the top
@@ -265,27 +287,27 @@ Two more BLEU-relevant strategies live outside `rerank.py` itself:
 
 ## 5. Architecture summary (for the report)
 
-`model.py`'s `GPTTranslator` is a decoder-only Transformer:
-- **One** shared token embedding (joint EN/VI BPE vocab) instead of
-  separate encoder/decoder vocabularies — a translation is generated by
-  continuing the sequence `<sos> <tovi> src <sep>` autoregressively, i.e.
-  translation is framed as "continue this sequence" rather than
-  "encode, then decode with cross-attention". A `<toen>`/`<tovi>`
-  direction tag makes the same model bidirectional (see §4).
-- 5 pre-LN Transformer blocks (causal self-attention + MLP), weight-tied
-  output projection (reuses the token embedding matrix instead of a
-  second `d_model × vocab` matrix).
-- Trained with the loss masked to the target span only (prefix-LM /
-  "GPT fine-tuned for translation" recipe).
+`model.py`'s `Seq2SeqTransformer` is the tiny encoder-decoder from the
+table at the top of this README:
+- Bidirectional encoder self-attention over the (denoised) noisy source;
+  causal decoder self-attention + cross-attention into the encoder output.
+- **One** shared token embedding (joint EN/VI BPE vocab), used for the
+  encoder input, the decoder input, AND (weight-tied) the output
+  projection — instead of three separate tables.
+- A leading `<toen>`/`<tovi>` direction tag on the encoder input makes
+  the same encoder+decoder pair bidirectional (see §4) at zero extra
+  parameters.
+- Sinusoidal positional encoding (0 trainable parameters).
 - Three decoding strategies are implemented and compared in `test.py`:
   **greedy** (`greedy_generate`), **beam search**
   (`beam_search_generate`/`beam_search_candidates`), and the
   **generate-many-then-rerank** pipeline (§4) — satisfying the "compare
   decoding strategies" requirement with more than a single alternative.
-- Self-attention lets any generated Vietnamese token attend directly back
-  to any English source position (including noisy ones) — the same
-  attention-map analysis an encoder-decoder would give you, and also
-  what powers the coverage-penalty term in §4.
+  The encoder is run ONCE per sentence and its output (`memory`) is
+  reused across every decode step/candidate.
+- Decoder cross-attention gives a direct per-step distribution over
+  source positions — the natural fit for both the attention-map
+  qualitative analysis and the coverage-penalty term in §4.
 
 Full parameter-budget math is in `model.py`'s module docstring.
 
@@ -296,8 +318,9 @@ Full parameter-budget math is in `model.py`'s module docstring.
 - **`FileNotFoundError` on `train_noisy.en.txt`**: the raw corpus isn't
   under `--data_dir` — check step 1 of setup.
 - **Parameter budget exceeded** (`train.py` raises `ValueError`): reduce
-  `--d_model`, `--d_ff`, `--n_layer`, or `--vocab_size` and re-run;
-  `python model.py` gives a fast parameter-count check without loading data.
+  `--d_model`, `--d_ff`, `--num_encoder_layers`, `--num_decoder_layers`,
+  or `--vocab_size` and re-run; `python model.py` gives a fast
+  parameter-count check without loading data.
 - **Training loss not decreasing**: sanity-check with a small
   `--max_train_samples` and a handful of `--epochs` first; verify
   `output/clean_data/` looks reasonable (open a few lines by hand) before

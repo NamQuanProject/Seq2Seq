@@ -1,13 +1,15 @@
 """
 rerank.py
 ---------
-"Generate many, then pick the best one" inference pipeline:
+"Generate many, then pick the best one" inference pipeline for the tiny
+Transformer encoder-decoder (model.py):
 
   1. Generate 10-30 candidates: a k-best beam search pool (diverse-ish by
      construction once combined with no-repeat-n-gram blocking) PLUS a
      handful of low-temperature top-k sampling draws (beam search alone
      tends to produce near-duplicate high-probability hypotheses; sampling
-     fills in genuinely different candidates).
+     fills in genuinely different candidates). The encoder runs ONCE per
+     source sentence and its output is reused across every candidate.
   2. Filter malformed candidates: no <eos> within the length budget,
      leaked special tokens, degenerate/near-empty output, excessive
      repeated n-grams.
@@ -20,8 +22,8 @@ rerank.py
 
      - length normalization (`alpha`) stops the score from favoring
        short/empty translations.
-     - C(x,y): GNMT-style coverage penalty from the model's own
-       self-attention over the source span -- rewards attending to (not
+     - C(x,y): GNMT-style coverage penalty from the decoder's own
+       cross-attention into the encoder -- rewards attending to (not
        silently dropping) every source token, which matters most when the
        source is noisy and easy to under-translate.
      - log P(x|y): reverse-direction score from the SAME model (trained
@@ -36,8 +38,9 @@ rerank.py
      one-off decoding artifacts that happened to score well under S(y|x).
 
 This module is architecture-agnostic beyond assuming `model` exposes
-`beam_search_candidates`, `sample_generate`, `score_sequence`, and
-`forward` (see model.py) and that `tok` is a `tokenizer.SubwordTokenizer`.
+`beam_search_candidates`, `sample_generate`, `score_sequence`,
+`coverage_vector` (see model.py) and that `tok` is a
+`tokenizer.SubwordTokenizer`.
 """
 import math
 from collections import Counter
@@ -45,7 +48,7 @@ from collections import Counter
 import torch
 
 from data import encode_pair
-from tokenizer import SOS_ID, EOS_ID, TOEN_ID, SEP_ID, SPECIAL_TOKENS
+from tokenizer import SOS_ID, EOS_ID, TOEN_ID, SPECIAL_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -104,16 +107,17 @@ def repetition_penalty(tokens, n=3):
     return repeats / max(1, len(ngrams))
 
 
-def filter_malformed(candidates, prompt_len, max_new_tokens, special_ids,
-                      min_gen_len=1, max_rep=0.3):
-    """candidates: list of {"seq": full_ids, ...}. Returns (kept, dropped_reasons).
-    A candidate's generated span is trimmed to its first <eos>; candidates
-    that never produce <eos> within the generation budget, are degenerate
-    (empty/too short), leak a special token into the body, or loop
-    excessively are dropped."""
+def filter_malformed(candidates, max_new_tokens, special_ids, min_gen_len=1, max_rep=0.3):
+    """candidates: list of {"seq": [sos, ...decoder tokens...]}. Every
+    candidate seq starts with a single leading <sos> (the decoder always
+    starts fresh, unlike the old prefix-LM packing). Returns (kept,
+    dropped_reasons). A candidate's generated span is trimmed to its first
+    <eos>; candidates that never produce <eos> within the generation
+    budget, are degenerate (empty/too short), leak a special token into
+    the body, or loop excessively are dropped."""
     kept, reasons = [], []
     for cand in candidates:
-        gen = cand["seq"][prompt_len:]
+        gen = cand["seq"][1:]  # strip the leading <sos>
         if EOS_ID not in gen:
             reasons.append("missing_eos")
             continue
@@ -140,38 +144,37 @@ def filter_malformed(candidates, prompt_len, max_new_tokens, special_ids,
 # S(y|x) reranking score
 # ---------------------------------------------------------------------------
 def score_candidates(
-    model, prompt_list, src_ids, candidates, src_span,
+    model, enc_ids_tensor, src_ids, src_span, candidates,
     alpha=0.9, lambda_cov=0.3, lambda_rev=0.2, lambda_rep=0.5,
 ):
     """candidates: list of {"body": [...]} (post-`filter_malformed`).
     Returns the same list, sorted best-first, each with an added
-    "score"/"logprob_fwd"/"logprob_rev"/"coverage"/"repetition" breakdown."""
+    "score"/"logprob_fwd"/"logprob_rev_norm"/"coverage"/"repetition" breakdown."""
     device = next(model.parameters()).device
-    reverse_prefix = [SOS_ID, TOEN_ID]
 
     out = []
     for cand in candidates:
         body = cand["body"]
-        full_seq = prompt_list + body + [EOS_ID]
-        ids_t = torch.tensor([full_seq], dtype=torch.long, device=device)
+        dec_full = torch.tensor([[SOS_ID] + body + [EOS_ID]], dtype=torch.long, device=device)
 
-        fwd_logprob, _ = model.score_sequence(ids_t)
+        fwd_logprob, _ = model.score_sequence(enc_ids_tensor, dec_full)
         length_norm = fwd_logprob / (len(body) + 1) ** alpha
 
         cov_term = 0.0
         coverage = None
-        if lambda_cov and src_span is not None and hasattr(model, "coverage_vector"):
-            coverage = model.coverage_vector(ids_t, src_span, gen_start=len(prompt_list) - 1)
-            if coverage:
+        if lambda_cov and src_span is not None:
+            full_cov = model.coverage_vector(enc_ids_tensor, dec_full)
+            if full_cov:
+                coverage = full_cov[src_span[0]:src_span[1]]
                 cov_term = sum(math.log(min(c, 1.0) + 1e-6) for c in coverage)
 
         rev_logprob = 0.0
         if lambda_rev and src_ids:
-            rev_seq = reverse_prefix + body + [SEP_ID] + src_ids + [EOS_ID]
-            if len(rev_seq) <= model.max_len:
-                rev_ids_t = torch.tensor([rev_seq], dtype=torch.long, device=device)
-                rev_logprob, _ = model.score_sequence(rev_ids_t)
-                rev_logprob = rev_logprob / (len(src_ids) + 1)
+            rev_enc = torch.tensor([[SOS_ID, TOEN_ID] + body + [EOS_ID]], dtype=torch.long, device=device)
+            rev_dec = torch.tensor([[SOS_ID] + src_ids + [EOS_ID]], dtype=torch.long, device=device)
+            if rev_enc.shape[1] <= model.max_len and rev_dec.shape[1] <= model.max_len:
+                raw_rev_logprob, _ = model.score_sequence(rev_enc, rev_dec)
+                rev_logprob = raw_rev_logprob / (len(src_ids) + 1)
 
         rep = repetition_penalty(body, n=3)
         score = length_norm + lambda_cov * cov_term + lambda_rev * rev_logprob - lambda_rep * rep
@@ -198,39 +201,37 @@ def generate_and_rerank(
 ):
     """Returns (best_text, best_candidate_dict, all_scored_candidates,
     dropped_reasons) for one source sentence."""
-    fwd_ids, _, sep_pos = encode_pair(src_text, "", tok, max_len, direction="en2vi")
-    prompt_list = fwd_ids[: sep_pos + 1]  # <sos><toVI> src... <sep>
-    prompt = torch.tensor([prompt_list], dtype=torch.long, device=device)
-    src_ids = prompt_list[2:sep_pos]
-    src_span = (2, sep_pos)
+    encoder_ids, _, _ = encode_pair(src_text, "", tok, max_len, direction="en2vi")
+    enc_ids_tensor = torch.tensor([encoder_ids], dtype=torch.long, device=device)
+    src_ids = encoder_ids[2:-1]  # strip <sos>, <tovi>, and the trailing <eos>
+    src_span = (2, len(encoder_ids) - 1)
 
     raw_candidates = []
     beam_cands = model.beam_search_candidates(
-        prompt, max_new_tokens=max_new_tokens, beam_width=beam_width, num_return=n_beam,
-        no_repeat_ngram_size=no_repeat_ngram_size, min_length=min_length, src_span=src_span,
+        enc_ids_tensor, max_new_tokens=max_new_tokens, beam_width=beam_width, num_return=n_beam,
+        no_repeat_ngram_size=no_repeat_ngram_size, min_length=min_length,
     )
     raw_candidates.extend({"seq": c["seq"]} for c in beam_cands)
     for _ in range(n_sample):
         s = model.sample_generate(
-            prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k,
+            enc_ids_tensor, max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k,
             no_repeat_ngram_size=no_repeat_ngram_size, min_length=min_length,
         )
         raw_candidates.append({"seq": s["seq"]})
 
     special_ids = set(range(len(SPECIAL_TOKENS)))
     kept, dropped_reasons = filter_malformed(
-        raw_candidates, prompt_len=len(prompt_list), max_new_tokens=max_new_tokens,
-        special_ids=special_ids,
+        raw_candidates, max_new_tokens=max_new_tokens, special_ids=special_ids,
     )
     if not kept:
         # Degenerate fallback: nothing survived filtering (e.g. very short
         # max_new_tokens) -- fall back to plain greedy so we always return
         # SOMETHING rather than raising.
         greedy_seq, _ = model.greedy_generate(
-            prompt, max_new_tokens=max_new_tokens,
+            enc_ids_tensor, max_new_tokens=max_new_tokens,
             no_repeat_ngram_size=no_repeat_ngram_size, min_length=min_length,
         )
-        gen = greedy_seq[len(prompt_list):]
+        gen = greedy_seq[1:]
         body = gen[: gen.index(EOS_ID)] if EOS_ID in gen else gen
         kept = [{"seq": greedy_seq, "body": body}]
 
@@ -244,7 +245,7 @@ def generate_and_rerank(
         deduped.append(c)
 
     scored = score_candidates(
-        model, prompt_list, src_ids, deduped, src_span=src_span,
+        model, enc_ids_tensor, src_ids, src_span, deduped,
         alpha=alpha, lambda_cov=lambda_cov, lambda_rev=lambda_rev, lambda_rep=lambda_rep,
     )
 
