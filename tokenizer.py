@@ -70,11 +70,35 @@ _ALPHA_RE = re.compile(r"^[a-z]+$")
 # "already a known word" and skips fixing them, and (b) wrongly accepts
 # gibberish fragments as valid split pieces. A minimum-frequency cutoff
 # fixes both failure modes.
+#
+# Two DIFFERENT thresholds, deliberately not shared, because they guard
+# opposite kinds of mistakes:
+#   - _MIN_WORD_FREQ (strict): used to accept a word-segmentation SPLIT
+#     PIECE as real (`_is_known_word`) and to decide whether a token is
+#     "common enough" that concatenation-repair shouldn't touch it. Being
+#     strict here is safe -- worst case a genuine-but-rare word is left
+#     alone (or a rare compound doesn't get split), which is a no-op, not
+#     data loss.
+#   - _MIN_DELETE_FREQ (lenient): used ONLY to decide whether
+#     `super_clean_text` DELETES a token outright. Reusing the strict
+#     300k threshold here (as an earlier version of this file did) is
+#     dangerous: plenty of legitimate, moderately-common English words
+#     never reach 300k in this table, so strict-threshold deletion
+#     silently destroys real source content the model should be
+#     translating -- exactly the kind of information loss the baseline's
+#     `normalize_string` (which deletes nothing) never risks. A low bar
+#     here means "delete only if this looks essentially unattested",
+#     erring toward keeping content rather than losing it.
 _MIN_WORD_FREQ = 300_000
+_MIN_DELETE_FREQ = 1_000
 
 
 def _is_known_word(tok: str) -> bool:
     return _UNIGRAMS.get(tok, 0) >= _MIN_WORD_FREQ
+
+
+def _is_attested_word(tok: str) -> bool:
+    return _UNIGRAMS.get(tok, 0) >= _MIN_DELETE_FREQ
 
 
 def _fix_concatenation(token: str) -> list:
@@ -152,17 +176,22 @@ def clean_text(s: str, stats: dict = None) -> str:
 
 def _is_unrecoverable_garbage(tok: str) -> bool:
     """True for a token that survived `clean_text`'s concatenation-repair
-    pass (see `_fix_concatenation`) and is STILL not a recognizable word --
-    i.e. it isn't a number, isn't punctuation, and isn't a short/common
-    token, so there is nothing left to "self-correct": it's noise, not a
-    typo. Short tokens (len<=2, e.g. 'i', 'a', 'ok', 'no') are exempted
-    since real short words are common and mostly below the frequency
-    cutoff `_is_known_word` uses for longer tokens."""
+    pass (see `_fix_concatenation`) and is STILL not even a LENIENTLY
+    recognizable word -- i.e. it isn't a number, isn't punctuation, isn't
+    a short/common token, and doesn't appear at all meaningfully in the
+    reference frequency table, so there is nothing left to "self-correct":
+    it's noise, not a real (if uncommon) word. Uses `_is_attested_word`
+    (low bar, `_MIN_DELETE_FREQ`), NOT the strict `_is_known_word` bar --
+    deletion is destructive and irreversible, so it should only fire on
+    tokens that are essentially unattested, not merely "less common than
+    300k in a noisy frequency table." Short tokens (len<=2, e.g. 'i', 'a',
+    'ok', 'no') are exempted since real short words are common and mostly
+    below any frequency cutoff anyway."""
     if not _ALPHA_RE.match(tok):
         return False  # numbers / punctuation are never "garbage" here
     if len(tok) <= 2:
         return False
-    return not _is_known_word(tok)
+    return not _is_attested_word(tok)
 
 
 def super_clean_text(s: str, stats: dict = None) -> str:

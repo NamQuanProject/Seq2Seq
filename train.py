@@ -33,7 +33,20 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
-def run_epoch(model, loader, optimizer, criterion, device, train=True):
+def noam_lr_lambda(step, d_model, warmup_steps):
+    """Transformer "Noam" schedule (Vaswani et al.): linear warmup for
+    `warmup_steps`, then inverse-sqrt decay. Standard for training small
+    Transformers from scratch -- a flat or plateau-triggered LR tends to
+    either destabilize the randomly-initialized attention layers early on
+    (too high before the model has found reasonable attention patterns)
+    or decay too late/coarsely once loss has already plateaued. Returns a
+    multiplier consumed by `LambdaLR` against a base optimizer lr of 1.0,
+    so the number IS the effective learning rate."""
+    step = max(step, 1)
+    return d_model ** -0.5 * min(step ** -0.5, step * warmup_steps ** -1.5)
+
+
+def run_epoch(model, loader, optimizer, criterion, device, scheduler=None, train=True):
     model.train() if train else model.eval()
     total_loss = 0.0
     ctx = torch.enable_grad() if train else torch.no_grad()
@@ -51,6 +64,8 @@ def run_epoch(model, loader, optimizer, criterion, device, train=True):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
             total_loss += loss.item()
     return total_loss / len(loader)
 
@@ -71,7 +86,17 @@ def main():
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr_schedule", choices=["noam", "plateau"], default="noam",
+                         help="'noam' (default): linear warmup + inverse-sqrt decay, stepped every "
+                              "batch -- standard for training small Transformers from scratch and "
+                              "generally converges faster/more stably than a flat-then-plateau LR. "
+                              "'plateau': the old flat-lr + ReduceLROnPlateau behavior.")
+    parser.add_argument("--lr", type=float, default=1.0,
+                         help="With --lr_schedule=noam, this is a scale multiplier on the Noam curve "
+                              "(1.0 gives a sensible peak LR at these defaults, ~1.4e-3). "
+                              "With --lr_schedule=plateau, this is the flat starting LR (e.g. 3e-4).")
+    parser.add_argument("--warmup_steps", type=int, default=4000,
+                         help="Noam schedule warmup length, in optimizer steps (only used with --lr_schedule=noam).")
     parser.add_argument("--max_len", type=int, default=128)
     parser.add_argument("--output_dir", default="./output")
     parser.add_argument("--param_budget", type=int, default=5_000_000)
@@ -137,8 +162,20 @@ def main():
     # overconfident on those. ignore_index skips <pad> positions in the
     # (batched, variable-length) decoder target.
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+
+    if args.lr_schedule == "noam":
+        optimizer = optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
+        train_scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: args.lr * noam_lr_lambda(step, args.d_model, args.warmup_steps),
+        )
+        plateau_scheduler = None
+        print(f"LR schedule: noam (warmup_steps={args.warmup_steps}, scale={args.lr}, "
+              f"peak lr~{args.lr * noam_lr_lambda(args.warmup_steps, args.d_model, args.warmup_steps):.2e})")
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
+        train_scheduler = None
+        plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+        print(f"LR schedule: plateau (flat lr={args.lr}, halved on val-loss plateau)")
 
     ckpts_dir = os.path.join(args.output_dir, "ckpts")
     if args.save_last_k > 0:
@@ -151,9 +188,11 @@ def main():
     print("Starting training...")
     for epoch in range(args.epochs):
         start = time.time()
-        train_loss = run_epoch(model, bundle.train_loader, optimizer, criterion, device, train=True)
+        train_loss = run_epoch(model, bundle.train_loader, optimizer, criterion, device,
+                                 scheduler=train_scheduler, train=True)
         val_loss = run_epoch(model, bundle.val_loader, optimizer, criterion, device, train=False)
-        scheduler.step(val_loss)
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(val_loss)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         elapsed = time.time() - start
@@ -184,8 +223,9 @@ def main():
                 if os.path.exists(stale):
                     os.remove(stale)
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(f"Epoch {epoch+1:02d}/{args.epochs} | Train Loss: {train_loss:.4f} "
-              f"| Val Loss: {val_loss:.4f} | {elapsed:.1f}s | best ckpt saved: {is_best}")
+              f"| Val Loss: {val_loss:.4f} | lr={current_lr:.2e} | {elapsed:.1f}s | best ckpt saved: {is_best}")
 
     # Plot loss curves
     plt.figure(figsize=(8, 5))

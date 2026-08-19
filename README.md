@@ -31,11 +31,14 @@ report.
 tokenizer.py            # denoising rules, noise augmentation, BPE subword tokenizer
 preprocess.py           # STEP 1 — writes a fully denoised copy of the corpus
 data.py                 # loads data (raw or preprocessed) into DataLoaders
+eval_utils.py           # shared fair-comparison eval subset (used by baseline.py AND test.py)
+baseline.py             # OPTIONAL — faithful vanilla-RNN baseline reproduction, for BLEU comparison
 model.py                # Seq2SeqTransformer: encoder-decoder + all decoding/scoring primitives
 train.py                # STEP 2 — trains the model, saves checkpoint(s) + loss curve
 average_checkpoints.py  # OPTIONAL — averages the last-K epoch checkpoints (SWA-style)
 rerank.py                # generate-many -> filter -> rerank inference pipeline
-test.py                 # STEP 3 — BLEU eval (greedy/beam/rerank) + qualitative/attention analysis
+test.py                 # STEP 3 — BLEU eval (Tier-1 fair / Tier-2 full, greedy/beam/rerank) + qualitative analysis
+Seq2Seq_MachineTranslation.ipynb  # notebook version of the same pipeline, runnable end to end
 requirements.txt
 exercise-machine-translation-student/
   machine_translation.ipynb   # original baseline notebook (vanilla RNN) + task spec
@@ -84,9 +87,18 @@ What it does, per English sentence:
    disallowed characters, and repair missing-space concatenations
    (`"ihavean apple"` → `"i have an apple"`) via dictionary-checked word
    segmentation.
-2. **Delete** what's left — any token that still isn't a recognizable
-   English word after step 1 (real injected gibberish, not a typo) is
-   removed from the sentence entirely.
+2. **Delete** what's left — any token that still isn't even a *leniently*
+   recognizable English word after step 1 (real injected gibberish, not a
+   typo) is removed from the sentence entirely. This deletion threshold
+   (`_MIN_DELETE_FREQ`) is deliberately much lower than the threshold used
+   to accept a concatenation-repair split (`_MIN_WORD_FREQ`) — deletion is
+   irreversible, so it only fires on tokens that are essentially
+   unattested, not merely "less common than the strict 300k bar." Unlike
+   the exercise notebook's `normalize_string` (which never deletes
+   anything), this step *can* destroy real content if the threshold is
+   too aggressive — worth spot-checking `output/clean_data/` against the
+   raw file, and citing `preprocess_stats.json`'s vocab-reduction numbers
+   in the report to show the tradeoff wasn't excessive.
 3. If a sentence becomes empty after deletion, the whole pair is dropped
    (an empty source carries no signal).
 
@@ -104,6 +116,23 @@ If you skip this step, `train.py`/`test.py` still work — `data.py` falls
 back to a conservative on-the-fly clean (no deletion) and prints a
 warning. Running `preprocess.py` first is recommended for the "super
 clean" strategy.
+
+### Step 1b — (optional but recommended) Train the baseline for comparison
+
+```bash
+python baseline.py --data_dir ./en-vi-translation-data --epochs 5
+```
+
+`baseline.py` is a **faithful, standalone reproduction** of the exercise
+notebook's vanilla-RNN Seq2Seq (whitespace `Vocabulary`, no attention,
+greedy-only decoding) — same `read_langs`/`normalize_string`/dataset
+logic, same architecture, same unsmoothed first-200-sentences BLEU
+methodology. It additionally evaluates on the exact same fixed subset
+`test.py` uses (`eval_utils.build_fair_eval_subset`), so its BLEU number
+is directly comparable to `test.py`'s "Tier 1" output — see §2's Step 3
+and the note on sample-size fairness there. Saves
+`output/baseline_checkpoint.pt`, `output/baseline_loss_curve.png`, and
+`output/baseline_results.json`.
 
 ### Step 2 — Train (`train.py`)
 
@@ -125,8 +154,16 @@ What it does:
   and **raises an error if it exceeds 5,000,000** (hard budget) — it also
   reports whether it clears the 2,500,000 bonus threshold.
 - Trains with standard cross-entropy over the decoder target
-  (`CrossEntropyLoss(ignore_index=<pad>, label_smoothing=0.1)`), gradient
-  clipping, and `ReduceLROnPlateau`.
+  (`CrossEntropyLoss(ignore_index=<pad>, label_smoothing=0.1)`) and
+  gradient clipping.
+- **Xavier/Glorot weight init** (`model.py`'s `_init_weights`) for every
+  Linear/attention projection, and a **Noam warmup + inverse-sqrt-decay LR
+  schedule** by default (`--lr_schedule noam`, stepped every batch, not
+  every epoch) — both are standard, well-established fixes for the
+  otherwise-slow, occasionally-unstable early training a from-scratch
+  small Transformer gets under a flat LR + default PyTorch init. Pass
+  `--lr_schedule plateau` to fall back to the old flat-lr +
+  `ReduceLROnPlateau` behavior.
 - **Bidirectional training**: a configurable fraction (`--p_reverse`,
   default 0.3) of training examples are packed VI→EN instead of EN→VI, so
   the SAME encoder+decoder pair can later score how well a candidate
@@ -153,7 +190,9 @@ Useful flags (all optional, see `python train.py --help`):
 | `--num_encoder_layers` / `--num_decoder_layers` | 3 / 3 | depth — tune these (and `--d_model`/`--d_ff`) to move the parameter count |
 | `--d_ff` | 512 | feedforward dimension |
 | `--batch_size` | 64 | |
-| `--lr` | 3e-4 | |
+| `--lr_schedule` | `noam` | `noam` (warmup+decay, recommended) or `plateau` (old behavior) |
+| `--lr` | 1.0 | Noam scale multiplier (peak lr ≈1.4e-3 at defaults); flat LR if `--lr_schedule plateau` |
+| `--warmup_steps` | 4000 | Noam warmup length in optimizer steps |
 | `--max_len` | 128 | max encoder/decoder sequence length |
 | `--p_reverse` | 0.3 | fraction of examples trained VI→EN (bidirectional model) |
 | `--augment_noise` / `--no_augment_noise` | on | train-time source noise augmentation |
@@ -190,14 +229,22 @@ python test.py --ckpt_path ./output/checkpoint.pt --data_dir ./en-vi-translation
 What it does:
 - Reloads the exact model config and cleaning mode used at training time
   (stored inside the checkpoint), so evaluation is reproducible.
-- Computes corpus BLEU-4 (with smoothing) on the noisy test set for
-  **greedy** decoding, then again for **beam search** (`--beam_width`,
-  default 5) — printed side by side so you can compare in the report.
-- Add `--rerank` for a third, stronger decoding strategy: generate 10-30
-  candidates (beam + low-temperature sampling), filter malformed ones,
-  and rerank with a translation-oriented score — see §4 below. This is
-  much slower per sentence, so it defaults to a 50-sentence subset
-  (`--rerank_eval_samples`, `None` = full test set).
+- **On sample-size fairness:** `baseline.py` (and the exercise notebook's
+  own baseline BLEU) is computed on only its first 200 test sentences.
+  Comparing that directly against a BLEU computed on the *entire* (much
+  larger, harder, noisier) test set is not apples-to-apples — a bigger,
+  unfiltered sample will almost always score lower regardless of model
+  quality. So `test.py` reports BLEU in two tiers:
+  - **Tier 1 (fair comparison)** — greedy / beam / rerank evaluated on
+    the exact same fixed subset `baseline.py` uses
+    (`eval_utils.build_fair_eval_subset`, `--eval_sample_size`, default
+    200). **This is the number to cite against the baseline.**
+  - **Tier 2 (full test set)** — evaluated on everything, for a more
+    rigorous (but NOT baseline-comparable) estimate; skip with
+    `--skip_full_test_set` for a faster run.
+- Add `--rerank` to also evaluate the generate-many-then-rerank strategy
+  (both tiers) — see §4 below. It's much slower per sentence, so Tier 2's
+  rerank pass defaults to a 50-sentence subset (`--rerank_eval_samples`).
 - Runs a qualitative pass on 3 hand-picked noisy sentences (including a
   clean vs. garbled apples example and a sentence full of slang/gibberish
   like `"vacx"`/`"lmao"`), printing greedy vs. beam **vs. rerank**
@@ -207,8 +254,9 @@ What it does:
   Vietnamese tokens is concentrated on the real source words rather than
   the noisy/garbage ones.
 
-Useful flags: `--max_eval_samples N` to subsample the test set for a
-quick greedy/beam sanity check before running full BLEU; `--beam_width`;
+Useful flags: `--eval_sample_size` (Tier 1 subset size, default 200,
+matching `baseline.py`); `--max_eval_samples N` to subsample Tier 2;
+`--skip_full_test_set` to skip Tier 2 entirely; `--beam_width`;
 `--rerank`, `--rerank_eval_samples`, `--n_beam`, `--n_sample`,
 `--temperature`, `--alpha`, `--lambda_cov`, `--lambda_rev`,
 `--lambda_rep`, `--use_mbr` (all tune the rerank pipeline, see §4).
@@ -230,6 +278,9 @@ output/
   ckpts/epoch_*.pt               # rolling checkpoints for averaging
   loss_curve.png                 # train/val loss vs. epoch
   attention_example_1.png ...3   # cross-attention heatmaps for the qualitative analysis
+  baseline_checkpoint.pt         # baseline.py output (optional)
+  baseline_loss_curve.png
+  baseline_results.json          # baseline BLEU, both methodologies (own-first-200 and shared-fair-subset)
 ```
 
 Everything needed for the report's plots/tables comes from this folder.
@@ -336,6 +387,17 @@ Full parameter-budget math is in `model.py`'s module docstring.
   relies on the checkpoint having been trained with `--p_reverse > 0`
   (the default). A checkpoint trained with `--p_reverse 0` never learned
   the `<toen>` direction, so set `--lambda_rev 0` when evaluating it.
+- **LR looks tiny / training seems slow at the very start**: expected
+  under `--lr_schedule noam` — it linearly warms up over `--warmup_steps`
+  (default 4000) batches before decaying; watch the printed `lr=` value
+  per epoch. If your dataset is small enough that 4000 steps is most of
+  training, lower `--warmup_steps` (e.g. to ~10% of total steps =
+  `epochs * (train_pairs / batch_size)`).
+- **Baseline and this model's Tier 1 numbers use different sentences**:
+  shouldn't happen since both go through
+  `eval_utils.build_fair_eval_subset` with the same `--eval_sample_size`,
+  but if you changed `--data_dir` between the two runs, re-run both
+  against the same corpus.
 
 ---
 

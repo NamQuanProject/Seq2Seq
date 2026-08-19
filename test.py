@@ -22,6 +22,7 @@ from data import load_data, encode_pair
 from model import build_model, count_parameters
 from tokenizer import clean_text, EOS_ID
 from rerank import generate_and_rerank
+from eval_utils import build_fair_eval_subset, DEFAULT_EVAL_SAMPLE_SIZE
 
 
 def ids_to_words(tok, ids):
@@ -29,8 +30,31 @@ def ids_to_words(tok, ids):
 
 
 @torch.no_grad()
+def evaluate_bleu_on_raw_pairs(model, tok, raw_pairs, device, max_len, generate_fn, max_new_tokens=60):
+    """Translates each (raw_src, raw_trg) pair directly through our own
+    clean_text pipeline (not the DataLoader) -- used for the fixed
+    fair-comparison subset (see eval_utils.py) so the sentence set is
+    guaranteed identical to baseline.py's."""
+    model.eval()
+    refs, hyps = [], []
+    for s_raw, t_raw in raw_pairs:
+        cleaned_src, cleaned_trg = clean_text(s_raw), clean_text(t_raw)
+        encoder_ids, _, _ = encode_pair(cleaned_src, "", tok, max_len)
+        enc = torch.tensor([encoder_ids], dtype=torch.long, device=device)
+        dec_seq = generate_fn(model, enc, max_new_tokens=max_new_tokens)
+        gen_ids = dec_seq[1:]
+        if EOS_ID in gen_ids:
+            gen_ids = gen_ids[: gen_ids.index(EOS_ID)]
+        hyps.append(ids_to_words(tok, gen_ids))
+        refs.append([cleaned_trg.split()])
+    smoothing = SmoothingFunction().method4
+    return corpus_bleu(refs, hyps, smoothing_function=smoothing) * 100
+
+
+@torch.no_grad()
 def evaluate_bleu(model, loader, tok, device, generate_fn, max_samples=None, max_new_tokens=60):
-    """generate_fn(model, enc_ids) -> list[int] decoder sequence (starting with <sos>)."""
+    """generate_fn(model, enc_ids) -> list[int] decoder sequence (starting with <sos>).
+    Full-test-set evaluation via the DataLoader (fast, batched iteration)."""
     model.eval()
     refs, hyps = [], []
     n_seen = 0
@@ -86,6 +110,19 @@ def evaluate_bleu_rerank(model, tok, pairs, device, max_len, max_samples=None, *
     return bleu
 
 
+@torch.no_grad()
+def evaluate_bleu_rerank_on_raw_pairs(model, tok, raw_pairs, device, max_len, **rerank_kwargs):
+    model.eval()
+    refs, hyps = [], []
+    for s_raw, t_raw in raw_pairs:
+        cleaned_src, cleaned_trg = clean_text(s_raw), clean_text(t_raw)
+        best_text, _, _, _ = generate_and_rerank(model, tok, cleaned_src, max_len, device, **rerank_kwargs)
+        hyps.append(best_text.split())
+        refs.append([cleaned_trg.split()])
+    smoothing = SmoothingFunction().method4
+    return corpus_bleu(refs, hyps, smoothing_function=smoothing) * 100
+
+
 def plot_attention(attn, src_tokens, trg_tokens, save_path):
     """attn: cross-attention matrix [trg_len, src_len] -- for each
     generated Vietnamese token (row), how much weight the decoder placed
@@ -113,7 +150,12 @@ def main():
     parser.add_argument("--tok_dir", default="./output/tokenizers")
     parser.add_argument("--ckpt_path", default="./output/checkpoint.pt")
     parser.add_argument("--output_dir", default="./output")
-    parser.add_argument("--max_eval_samples", type=int, default=None)
+    parser.add_argument("--eval_sample_size", type=int, default=DEFAULT_EVAL_SAMPLE_SIZE,
+                         help="Size of the fixed, baseline.py-comparable Tier-1 evaluation subset.")
+    parser.add_argument("--skip_full_test_set", action="store_true",
+                         help="Skip the (larger, slower) Tier-2 full-test-set evaluation and only run Tier 1.")
+    parser.add_argument("--max_eval_samples", type=int, default=None,
+                         help="Optional cap on the Tier-2 full-test-set evaluation (speed knob); None = every test sentence.")
     parser.add_argument("--beam_width", type=int, default=5)
     parser.add_argument("--rerank", action="store_true",
                          help="Also evaluate the generate-many-then-rerank pipeline (rerank.py). "
@@ -163,36 +205,68 @@ def main():
 
     max_new_tokens = train_args["max_len"] // 2
 
-    # --- Quantitative: BLEU, greedy vs beam search ---
-    print("\n=== Greedy decoding ===")
-    bleu_greedy, _, _ = evaluate_bleu(
-        model, bundle.test_loader, bundle.tok, device,
-        greedy_generate_fn, max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
-    )
-    print(f"Greedy BLEU on noisy test set: {bleu_greedy:.2f}")
-
-    print("\n=== Beam search decoding ===")
-    bleu_beam, _, _ = evaluate_bleu(
-        model, bundle.test_loader, bundle.tok, device,
-        lambda m, e, max_new_tokens: beam_generate_fn(m, e, max_new_tokens=max_new_tokens, beam_width=args.beam_width),
-        max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
-    )
-    print(f"Beam search (width={args.beam_width}) BLEU on noisy test set: {bleu_beam:.2f}")
-
     rerank_kwargs = dict(
         n_beam=args.n_beam, n_sample=args.n_sample, beam_width=args.beam_width,
         temperature=args.temperature, max_new_tokens=max_new_tokens,
         alpha=args.alpha, lambda_cov=args.lambda_cov, lambda_rev=args.lambda_rev,
         lambda_rep=args.lambda_rep, use_mbr=args.use_mbr,
     )
+
+    # --- Tier 1: fair comparison against baseline.py ---------------------
+    # baseline.py's BLEU (and the exercise notebook's own methodology) is
+    # computed on a fixed, small sentence subset. Comparing that directly
+    # against a BLEU computed over the full (much larger, harder) test set
+    # is not apples-to-apples -- so evaluate this model on the EXACT SAME
+    # subset baseline.py uses, for a number that's actually comparable.
+    test_src = os.path.join(args.data_dir, "test_noisy.en.txt")
+    test_trg = os.path.join(args.data_dir, "test.vi.txt")
+    fair_eval_pairs = build_fair_eval_subset(test_src, test_trg, n=args.eval_sample_size)
+    print(f"=== Tier 1: fair comparison on the shared {len(fair_eval_pairs)}-sentence subset "
+          f"(run baseline.py for the comparable baseline number) ===")
+
+    bleu_greedy_fair = evaluate_bleu_on_raw_pairs(
+        model, bundle.tok, fair_eval_pairs, device, train_args["max_len"],
+        greedy_generate_fn, max_new_tokens=max_new_tokens,
+    )
+    print(f"Ours -- greedy      : {bleu_greedy_fair:.2f}")
+
+    bleu_beam_fair = evaluate_bleu_on_raw_pairs(
+        model, bundle.tok, fair_eval_pairs, device, train_args["max_len"],
+        lambda m, e, max_new_tokens: beam_generate_fn(m, e, max_new_tokens=max_new_tokens, beam_width=args.beam_width),
+        max_new_tokens=max_new_tokens,
+    )
+    print(f"Ours -- beam search  : {bleu_beam_fair:.2f}")
+
     if args.rerank:
-        print("\n=== Generate-candidates + rerank decoding ===")
-        bleu_rerank = evaluate_bleu_rerank(
-            model, bundle.tok, bundle.test_pairs_clean, device, train_args["max_len"],
-            max_samples=args.rerank_eval_samples, **rerank_kwargs,
+        bleu_rerank_fair = evaluate_bleu_rerank_on_raw_pairs(
+            model, bundle.tok, fair_eval_pairs, device, train_args["max_len"], **rerank_kwargs,
         )
-        n_eval = args.rerank_eval_samples or len(bundle.test_pairs_clean)
-        print(f"Rerank BLEU on noisy test set (n={n_eval}): {bleu_rerank:.2f}")
+        print(f"Ours -- rerank       : {bleu_rerank_fair:.2f}")
+
+    # --- Tier 2: full test set (this model only, NOT baseline-comparable) --
+    if not args.skip_full_test_set:
+        print(f"\n=== Tier 2: full test set (n={len(bundle.test_pairs_clean)}, larger/harder -- "
+              f"NOT directly comparable to Tier 1 above) ===")
+        bleu_greedy, _, _ = evaluate_bleu(
+            model, bundle.test_loader, bundle.tok, device,
+            greedy_generate_fn, max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
+        )
+        print(f"Ours -- greedy      : {bleu_greedy:.2f}")
+
+        bleu_beam, _, _ = evaluate_bleu(
+            model, bundle.test_loader, bundle.tok, device,
+            lambda m, e, max_new_tokens: beam_generate_fn(m, e, max_new_tokens=max_new_tokens, beam_width=args.beam_width),
+            max_samples=args.max_eval_samples, max_new_tokens=max_new_tokens,
+        )
+        print(f"Ours -- beam search  : {bleu_beam:.2f}")
+
+        if args.rerank:
+            bleu_rerank = evaluate_bleu_rerank(
+                model, bundle.tok, bundle.test_pairs_clean, device, train_args["max_len"],
+                max_samples=args.rerank_eval_samples, **rerank_kwargs,
+            )
+            n_eval = args.rerank_eval_samples or len(bundle.test_pairs_clean)
+            print(f"Ours -- rerank (n={n_eval}) : {bleu_rerank:.2f}")
 
     # --- Qualitative: hand-picked noisy sentences + attention map ---
     print("\n=== Qualitative analysis ===")

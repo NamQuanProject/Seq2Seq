@@ -160,6 +160,24 @@ class Seq2SeqTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.output_bias = nn.Parameter(torch.zeros(vocab_size))
 
+        self._init_weights()
+
+    def _init_weights(self):
+        """Xavier/Glorot init for every weight matrix with >1 dim (Linear
+        and MultiheadAttention projections), matching the original
+        "Attention Is All You Need" recipe. Left to PyTorch's default
+        (small normal), a from-scratch Transformer this small tends to
+        start with noisy attention logits and takes noticeably longer to
+        leave a poor loss plateau; Xavier init keeps the variance of
+        activations roughly constant through the stack from step 1,
+        which measurably speeds up and stabilizes early convergence.
+        Biases are left at zero (PyTorch default) and LayerNorm/embedding
+        parameters are left alone (embeddings already get a principled
+        scale from the sqrt(d_model) multiply in `_embed`)."""
+        for name, p in self.named_parameters():
+            if p.dim() > 1 and "tok_emb" not in name:
+                nn.init.xavier_uniform_(p)
+
     def _embed(self, ids):
         return self.emb_dropout(self.pos_enc(self.tok_emb(ids) * math.sqrt(self.d_model)))
 
