@@ -203,7 +203,12 @@ def main():
     print(f"Loaded model with {n_params:,} trainable parameters "
           f"(budget: {train_args.get('param_budget', 5_000_000):,})")
 
-    max_new_tokens = train_args["max_len"] // 2
+    # Must match training's decoder budget (data.py's encode_pair:
+    # dec_budget = max_len - 2), NOT an arbitrary fraction of it -- capping
+    # generation lower than what training taught the model to produce
+    # would silently truncate any translation that legitimately needs more
+    # tokens than the cap, regardless of what the model actually learned.
+    max_new_tokens = train_args["max_len"] - 2
 
     rerank_kwargs = dict(
         n_beam=args.n_beam, n_sample=args.n_sample, beam_width=args.beam_width,

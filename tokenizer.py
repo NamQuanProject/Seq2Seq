@@ -1,36 +1,44 @@
 """
 tokenizer.py
 ------------
-Denoising text cleanup + subword (BPE) tokenization.
+Denoising text cleanup + subword (SentencePiece Unigram) tokenization.
 
-Why BPE instead of whitespace-split word vocab (like the baseline)?
-  - The baseline's `Vocabulary` treats every distinct whitespace-separated
-    token as a new word. Noisy data (missing spaces, garbage strings,
-    typos) explodes the vocabulary with one-off "words" that are seen once
-    and never learned well -> huge embedding tables + terrible generalization.
-  - A subword vocabulary (Byte-Pair Encoding) caps vocab size, represents
-    unseen/garbled tokens as combinations of known sub-word pieces instead
-    of a single <unk>, and is inherently more robust to spelling noise
-    ("apple" vs "aple" share subword pieces).
+Why a subword vocabulary instead of the baseline's whitespace `Vocabulary`?
+  - The baseline treats every distinct whitespace-separated token as a new
+    word. Noisy data (missing spaces, garbage strings, typos) explodes the
+    vocabulary with one-off "words" that are seen once and never learned
+    well -> huge embedding tables + terrible generalization.
+  - A subword vocabulary caps vocab size, represents unseen/garbled tokens
+    as combinations of known sub-word pieces instead of a single <unk>,
+    and is inherently more robust to spelling noise ("apple" vs "aple"
+    share subword pieces).
   - Smaller, shared-size vocab also directly reduces trainable parameters
     (embedding tables + output projection), which helps the 5M param budget.
+
+Why Unigram (SentencePiece) rather than BPE specifically: Unigram is a
+probabilistic segmentation model (keeps a large candidate piece inventory
+and prunes to the vocab that maximizes corpus likelihood) rather than
+BPE's greedy pairwise-merge heuristic, and it natively supports **subword
+regularization** -- sampling a different, still-valid segmentation of the
+same sentence on each training pass instead of always the single
+deterministic split. For a from-scratch model trained on already-noisy
+text, exposing it to segmentation variance is another axis of robustness
+on top of the source-noise augmentation below (see `encode_ids(sample=True)`).
 
 This module is intentionally the ONLY place that knows about the raw text
 denoising rules AND the subword model, so data.py can stay simple.
 """
 import html
 import os
+import random
 import re
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import Whitespace
-from tokenizers.normalizers import NFKC, Lowercase, Sequence as NormSequence
+
+import sentencepiece as spm
 from wordsegment import load as _ws_load, segment as _ws_segment, UNIGRAMS as _UNIGRAMS
 
 _ws_load()  # loads bundled unigram/bigram frequency tables (no network needed)
 
-PAD, UNK, SOS, EOS, SEP = "<pad>", "<unk>", "<sos>", "<eos>", "<sep>"
+PAD, UNK, SOS, EOS = "<pad>", "<unk>", "<sos>", "<eos>"
 # Direction tags: training on BOTH <toVI> (EN->VI, the real task) and
 # <toEN> (VI->EN) examples with the same shared vocab/stack turns the one
 # model bidirectional at zero extra inference-time parameters. This is
@@ -38,8 +46,8 @@ PAD, UNK, SOS, EOS, SEP = "<pad>", "<unk>", "<sos>", "<eos>", "<sep>"
 # probability log P(x|y) with the SAME model instead of needing a second
 # trained reverse model.
 TOEN, TOVI = "<toen>", "<tovi>"
-SPECIAL_TOKENS = [PAD, UNK, SOS, EOS, SEP, TOEN, TOVI]
-PAD_ID, UNK_ID, SOS_ID, EOS_ID, SEP_ID, TOEN_ID, TOVI_ID = 0, 1, 2, 3, 4, 5, 6
+SPECIAL_TOKENS = [PAD, UNK, SOS, EOS, TOEN, TOVI]
+PAD_ID, UNK_ID, SOS_ID, EOS_ID, TOEN_ID, TOVI_ID = 0, 1, 2, 3, 4, 5
 
 
 # ---------------------------------------------------------------------------
@@ -298,64 +306,141 @@ def augment_noise(s: str, rng, p_char: float = 0.03, p_delete: float = 0.01, p_c
 
 
 # ---------------------------------------------------------------------------
-# 2) BPE subword tokenizer (trained on the cleaned training corpus only)
+# 2) SentencePiece Unigram subword tokenizer (trained on the cleaned
+#    training corpus only), with byte-fallback so no input character can
+#    ever produce a hard failure, and optional subword-regularization
+#    sampling for training-time segmentation variance.
 # ---------------------------------------------------------------------------
 class SubwordTokenizer:
-    def __init__(self, vocab_size: int = 6000):
+    def __init__(self, vocab_size: int = 8000):
         self.vocab_size = vocab_size
-        self.tk = Tokenizer(BPE(unk_token=UNK))
-        self.tk.normalizer = NormSequence([NFKC(), Lowercase()])
-        self.tk.pre_tokenizer = Whitespace()
+        self.sp = None  # spm.SentencePieceProcessor, set by train()/load()
 
-    def train(self, lines):
-        """lines: iterable of already-cleaned strings."""
-        trainer = BpeTrainer(
-            vocab_size=self.vocab_size,
-            special_tokens=SPECIAL_TOKENS,
-            min_frequency=2,
-        )
-        self.tk.train_from_iterator(lines, trainer=trainer)
+    def train(self, lines, model_prefix):
+        """lines: iterable of already-cleaned strings (write once to a temp
+        corpus file, since SentencePieceTrainer trains from a file path).
+        `model_prefix` (no extension) is where the `.model`/`.vocab` files
+        land -- same base path `save()`/`load()` use."""
+        os.makedirs(os.path.dirname(model_prefix) or ".", exist_ok=True)
+        corpus_path = model_prefix + "_corpus.tmp.txt"
+        with open(corpus_path, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+        try:
+            spm.SentencePieceTrainer.train(
+                input=corpus_path, model_prefix=model_prefix, model_type="unigram",
+                vocab_size=self.vocab_size, character_coverage=1.0, shuffle_input_sentence=True,
+                pad_id=PAD_ID, unk_id=UNK_ID, bos_id=SOS_ID, eos_id=EOS_ID,
+                pad_piece=PAD, unk_piece=UNK, bos_piece=SOS, eos_piece=EOS,
+                user_defined_symbols=[TOEN, TOVI],  # appended right after the 4 control ids -> TOEN_ID, TOVI_ID
+                byte_fallback=True, hard_vocab_limit=True,
+            )
+        finally:
+            if os.path.exists(corpus_path):
+                os.remove(corpus_path)
+        self.sp = spm.SentencePieceProcessor(model_file=model_prefix + ".model")
+        self._verify_special_ids()
+
+    def _verify_special_ids(self):
+        """Fail loudly at load time (not silently mid-training) if the
+        trained/loaded model's special-token ids ever drift from what the
+        rest of the codebase assumes."""
+        expected = {PAD_ID: PAD, UNK_ID: UNK, SOS_ID: SOS, EOS_ID: EOS, TOEN_ID: TOEN, TOVI_ID: TOVI}
+        for expected_id, piece in expected.items():
+            actual_id = self.sp.piece_to_id(piece)
+            assert actual_id == expected_id, (
+                f"Tokenizer special-token id drift: {piece!r} is id {actual_id}, expected {expected_id}. "
+                "Delete the stale tokenizer files under output/tokenizers/ and retrain."
+            )
 
     # -- encode / decode -----------------------------------------------
-    def encode_ids(self, text: str):
-        return self.tk.encode(text).ids
+    def encode_ids(self, text: str, sample: bool = False):
+        """sample=True draws a random (still-valid) Unigram segmentation
+        instead of the single best one -- subword regularization, meant
+        for the TRAINING split only (val/test must stay deterministic)."""
+        if sample:
+            return self.sp.encode(text, out_type=int, enable_sampling=True,
+                                    nbest_size=-1, alpha=0.1)
+        return self.sp.encode(text, out_type=int)
 
     def encode_with_specials(self, text: str):
         return [SOS_ID] + self.encode_ids(text) + [EOS_ID]
 
     def decode_ids(self, ids, skip_specials=True):
         if skip_specials:
-            special_ids = (PAD_ID, SOS_ID, EOS_ID, SEP_ID, TOEN_ID, TOVI_ID)
+            special_ids = (PAD_ID, SOS_ID, EOS_ID, TOEN_ID, TOVI_ID)
             ids = [i for i in ids if i not in special_ids]
-        return self.tk.decode(ids)
+        return self.sp.decode(ids)
 
     @property
     def vocab_size_actual(self):
-        return self.tk.get_vocab_size()
+        return self.sp.get_piece_size()
 
     # -- persistence ------------------------------------------------------
     def save(self, path):
-        self.tk.save(path)
+        pass  # SentencePieceTrainer already wrote <prefix>.model/.vocab in train()
 
     @classmethod
-    def load(cls, path):
+    def load(cls, model_prefix):
         obj = cls()
-        obj.tk = Tokenizer.from_file(path)
-        obj.vocab_size = obj.tk.get_vocab_size()
+        obj.sp = spm.SentencePieceProcessor(model_file=model_prefix + ".model")
+        obj.vocab_size = obj.sp.get_piece_size()
+        obj._verify_special_ids()
         return obj
 
 
-def build_or_load_tokenizer(cleaned_lines, save_path, vocab_size=6000):
-    """Train a tokenizer if save_path doesn't exist yet, else load it.
-    Always train tokenizers ONLY on the training split to avoid leaking
-    val/test vocabulary/statistics into preprocessing."""
-    if os.path.exists(save_path):
-        return SubwordTokenizer.load(save_path)
+def build_or_load_tokenizer(cleaned_lines, save_path, vocab_size=8000):
+    """Train a tokenizer if save_path (a `<prefix>.model` path) doesn't
+    exist yet, else load it. Always train tokenizers ONLY on the training
+    split to avoid leaking val/test vocabulary/statistics into preprocessing."""
+    model_prefix = save_path[:-6] if save_path.endswith(".model") else save_path
+    if os.path.exists(model_prefix + ".model"):
+        return SubwordTokenizer.load(model_prefix)
     tok = SubwordTokenizer(vocab_size=vocab_size)
-    tok.train(cleaned_lines)
-    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    tok.save(save_path)
+    tok.train(cleaned_lines, model_prefix)
     return tok
+
+
+# ---------------------------------------------------------------------------
+# 1c) Word-level noise augmentation (alternative/complementary to the
+#     character-level `augment_noise` above; applied at TRAIN time only)
+# ---------------------------------------------------------------------------
+# Directly mimics the noise TYPES the assignment describes at the word
+# level: "join" simulates a missing-space concatenation, "garbage"
+# simulates an injected nonsense token, "swap"/"delete" simulate local
+# word-order/dropout noise, and "unk" forces exposure to the <unk> id so
+# the model doesn't treat it as a rare, ignorable event at test time.
+_WORD_AUGMENT_PROBS = {"join": 0.45, "garbage": 0.25, "swap": 0.15, "delete": 0.10, "unk": 0.05}
+
+
+def augment_noise_word_level(s: str, rng, sentence_prob: float = 0.2, probs: dict = None):
+    """Returns (augmented_sentence, force_unk). `force_unk` signals the
+    caller to overwrite one encoded id with UNK_ID post-tokenization (the
+    "unk" operation can't be expressed as a text edit). `sentence_prob` is
+    the chance any augmentation fires at all for this sentence (matches
+    most sentences passing through unaltered, like `augment_noise`)."""
+    if rng.random() >= sentence_prob:
+        return s, False
+    words = s.split()
+    if len(words) < 2:
+        return s, False
+    probs = probs or _WORD_AUGMENT_PROBS
+    draw, total, operation = rng.random(), 0.0, "unk"
+    for name, probability in probs.items():
+        total += probability
+        if draw < total:
+            operation = name
+            break
+    index = rng.randrange(len(words) - 1) if operation in ("join", "swap") else rng.randrange(len(words))
+    if operation == "join":
+        words[index:index + 2] = [words[index] + words[index + 1]]
+    elif operation == "swap":
+        words[index], words[index + 1] = words[index + 1], words[index]
+    elif operation == "delete":
+        del words[index]
+    elif operation == "garbage":
+        words.insert(index, "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(3, 8))))
+    return " ".join(words), operation == "unk"
 
 
 if __name__ == "__main__":

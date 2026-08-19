@@ -104,13 +104,25 @@ def main():
     parser.add_argument("--p_reverse", type=float, default=0.3,
                          help="Fraction of training examples packed VI->EN instead of EN->VI, "
                               "making the model bidirectional (enables reverse-model rescoring in rerank.py).")
-    parser.add_argument("--augment_noise", action="store_true", default=True,
-                         help="Apply tokenizer.augment_noise (typos/case/char-drop) to the English "
-                              "source at train time, resampled every epoch.")
-    parser.add_argument("--no_augment_noise", dest="augment_noise", action="store_false")
+    parser.add_argument("--augment_mode", choices=["none", "char", "word", "both"], default="char",
+                         help="Train-time English-source noise augmentation: 'char' (keyboard typos/"
+                              "case/char-drop), 'word' (join/swap/delete/garbage/unk -- mirrors the "
+                              "assignment's actual noise types), 'both', or 'none'.")
+    parser.add_argument("--subword_regularization", action="store_true",
+                         help="Sample a random (still-valid) SentencePiece Unigram segmentation per "
+                              "training access instead of the single deterministic best split -- an "
+                              "extra axis of robustness on top of --augment_mode.")
+    parser.add_argument("--max_tokens_per_batch", type=int, default=None,
+                         help="If set, uses token-budget bucketed batching (LengthBucketBatchSampler) "
+                              "instead of fixed-size batches -- less padding waste. --batch_size still "
+                              "caps the example count per batch as a safety net.")
     parser.add_argument("--save_last_k", type=int, default=3,
                          help="Also keep a rolling window of the last K epoch checkpoints in "
                               "output/ckpts/ for weight averaging (see average_checkpoints.py). 0 disables.")
+    parser.add_argument("--early_stopping_patience", type=int, default=0,
+                         help="Stop if val loss hasn't improved by --early_stopping_min_delta for this "
+                              "many epochs. 0 (default) disables early stopping.")
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -131,7 +143,9 @@ def main():
         vocab_size=args.vocab_size,
         stats_path=os.path.join(args.output_dir, "denoise_stats.json"),
         p_reverse=args.p_reverse,
-        augment_noise_p=args.augment_noise,
+        augment_mode=args.augment_mode,
+        subword_regularization=args.subword_regularization,
+        max_tokens_per_batch=args.max_tokens_per_batch,
     )
 
     model = build_model(
@@ -184,6 +198,7 @@ def main():
     train_losses, val_losses = [], []
     best_val_loss = float("inf")
     saved_ckpts = []
+    epochs_since_improvement = 0
 
     print("Starting training...")
     for epoch in range(args.epochs):
@@ -206,9 +221,11 @@ def main():
         }
 
         is_best = val_loss < best_val_loss
+        meaningfully_improved = val_loss < best_val_loss - args.early_stopping_min_delta
         if is_best:
             best_val_loss = val_loss
             torch.save(ckpt_payload, ckpt_path)
+        epochs_since_improvement = 0 if meaningfully_improved else epochs_since_improvement + 1
 
         # Rolling window of the last K epoch checkpoints, independent of
         # whether this epoch was the single best -- weight averaging (see
@@ -226,6 +243,11 @@ def main():
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"Epoch {epoch+1:02d}/{args.epochs} | Train Loss: {train_loss:.4f} "
               f"| Val Loss: {val_loss:.4f} | lr={current_lr:.2e} | {elapsed:.1f}s | best ckpt saved: {is_best}")
+
+        if args.early_stopping_patience > 0 and epochs_since_improvement >= args.early_stopping_patience:
+            print(f"Early stopping: no val-loss improvement > {args.early_stopping_min_delta} for "
+                  f"{args.early_stopping_patience} epochs.")
+            break
 
     # Plot loss curves
     plt.figure(figsize=(8, 5))
