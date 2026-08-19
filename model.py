@@ -255,70 +255,87 @@ class Seq2SeqTransformer(nn.Module):
         self, enc_ids, max_new_tokens=60, beam_width=10, num_return=10,
         length_penalty=0.7, no_repeat_ngram_size=3, min_length=1,
     ):
-        """k-best beam search. The encoder runs ONCE (its output doesn't
-        depend on the beam), and every beam's decode step reuses that same
-        `memory` -- returns up to `num_return` candidates as dicts
-        {"seq": [...], "logprob": float, "coverage": [float]} where
-        `coverage` is the GNMT-style sum of cross-attention weights each
-        beam placed over the (full) encoder sequence across all its decode
-        steps (rerank.py slices out the real source-token span)."""
+        """Batched beam search: all `beam_width` beams are stacked into one
+        batch dimension and decoded with a SINGLE forward pass per step,
+        instead of a Python loop calling `decode()` once per beam. The
+        encoder still runs ONCE and `memory` is expanded (not recomputed)
+        across the beam dimension. This is the practical win for a small
+        model like this one: on top of the encoder-once optimization, the
+        per-step decoder forward pass is what dominates beam search cost,
+        and batching it keeps the GPU (or even CPU vectorized ops) doing
+        one wide matmul instead of `beam_width` narrow sequential ones.
+
+        Finished beams are frozen in place (kept alive by forcing their
+        next token to <eos> at zero additional log-prob) rather than
+        removed, which is what keeps every step a fixed-shape batched op --
+        the standard trick (e.g. fairseq's SequenceGenerator) for
+        batched beam search without variable-width tensors. One
+        consequence: at most `beam_width` distinct trajectories are ever
+        tracked, so if `num_return` is requested larger than `beam_width`,
+        the search is silently run with a wider beam instead of quietly
+        returning fewer candidates than asked for.
+
+        Returns up to `num_return` candidates as dicts {"seq": [...],
+        "logprob": float, "coverage": None} -- `coverage` is no longer
+        computed here (rerank.py always recomputes it per final candidate
+        via `coverage_vector`, so carrying it through the beam search was
+        dead weight)."""
         assert enc_ids.shape[0] == 1
         self.eval()
+        device = enc_ids.device
+        beam_width = max(beam_width, num_return)
+
         memory, memory_kpm = self.encode(enc_ids)
-        src_len = memory.shape[1]
+        memory = memory.expand(beam_width, -1, -1)
+        memory_kpm = memory_kpm.expand(beam_width, -1)
 
-        def norm_score(seq, score):
-            return score / max(1, len(seq) - 1) ** length_penalty
+        beams_seq = [[self.sos_id] for _ in range(beam_width)]
+        beam_scores = torch.zeros(beam_width, device=device)
+        beam_scores[1:] = float("-inf")  # only beam 0 is "real" at step 0 -- avoids beam_width identical seeds
+        finished = torch.zeros(beam_width, dtype=torch.bool, device=device)
 
-        beams = [([self.sos_id], 0.0, False, [0.0] * src_len)]
-        finished_hyps = []
+        def norm_score(seq_len, score):
+            return score / max(1, seq_len - 1) ** length_penalty
 
         for _ in range(max_new_tokens):
-            candidates = []
-            any_active = False
-            for seq, score, finished, cov in beams:
-                if finished or len(seq) >= self.max_len:
-                    if finished:
-                        finished_hyps.append((seq, score, cov))
+            if bool(finished.all()) or len(beams_seq[0]) >= self.max_len:
+                break
+            dec_ids = torch.tensor(beams_seq, dtype=torch.long, device=device)  # [beam_width, cur_len]
+            logits, _ = self.decode(dec_ids, memory, memory_kpm)
+            log_probs = F.log_softmax(logits[:, -1, :], dim=-1)  # [beam_width, vocab]
+
+            for b in range(beam_width):
+                if finished[b].item():
+                    log_probs[b] = float("-inf")
+                    log_probs[b, self.eos_id] = 0.0  # zero-cost "stay finished" continuation
                     continue
-                any_active = True
-                dec_ids = torch.tensor([seq], dtype=torch.long, device=enc_ids.device)
-                logits, attn = self.decode(dec_ids, memory, memory_kpm)
-                step_attn = attn[0, -1, :].tolist()
+                if len(beams_seq[b]) - 1 < min_length:
+                    log_probs[b, self.eos_id] = float("-inf")
+                for banned in _banned_next_tokens(beams_seq[b], no_repeat_ngram_size):
+                    log_probs[b, banned] = float("-inf")
 
-                log_probs = F.log_softmax(logits[0, -1], dim=-1).clone()
-                if len(seq) - 1 < min_length:
-                    log_probs[self.eos_id] = float("-inf")
-                for banned in _banned_next_tokens(seq, no_repeat_ngram_size):
-                    log_probs[banned] = float("-inf")
+            candidate_scores = (beam_scores.unsqueeze(1) + log_probs).reshape(-1)  # [beam_width * vocab]
+            vocab_size = log_probs.size(-1)
+            topk_scores, topk_flat = candidate_scores.topk(beam_width)
+            parent_beams = torch.div(topk_flat, vocab_size, rounding_mode="floor")
+            next_tokens = topk_flat % vocab_size
 
-                topk = min(beam_width, log_probs.size(-1))
-                topk_log_probs, topk_ids = log_probs.topk(topk)
-                for k in range(topk):
-                    tok = topk_ids[k].item()
-                    new_cov = [c + a for c, a in zip(cov, step_attn)]
-                    candidates.append((
-                        seq + [tok], score + topk_log_probs[k].item(),
-                        tok == self.eos_id, new_cov,
-                    ))
-            if not any_active:
-                break
+            new_beams_seq, new_finished = [], []
+            for i in range(beam_width):
+                parent = parent_beams[i].item()
+                tok = next_tokens[i].item()
+                new_beams_seq.append(beams_seq[parent] + [tok])
+                new_finished.append(bool(finished[parent].item()) or tok == self.eos_id)
+            beams_seq = new_beams_seq
+            beam_scores = topk_scores
+            finished = torch.tensor(new_finished, dtype=torch.bool, device=device)
 
-            candidates.sort(key=lambda c: norm_score(c[0], c[1]), reverse=True)
-            beams = candidates[:beam_width]
-            if len(finished_hyps) >= num_return and all(b[2] for b in beams):
-                break
-
-        already = {tuple(s) for s, _, _ in finished_hyps}
-        for seq, score, finished, cov in beams:
-            if tuple(seq) not in already:
-                finished_hyps.append((seq, score, cov))
-
-        finished_hyps.sort(key=lambda c: norm_score(c[0], c[1]), reverse=True)
-        return [
-            {"seq": seq, "logprob": score, "coverage": cov}
-            for seq, score, cov in finished_hyps[:num_return]
+        results = [
+            {"seq": beams_seq[b], "logprob": beam_scores[b].item(), "coverage": None}
+            for b in range(beam_width)
         ]
+        results.sort(key=lambda c: norm_score(len(c["seq"]), c["logprob"]), reverse=True)
+        return results[:num_return]
 
     @torch.no_grad()
     def sample_generate(

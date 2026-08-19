@@ -14,7 +14,7 @@ is a **tiny Transformer encoder-decoder**, sized to land around
 | Model dimension | 128 |
 | Attention heads | 4 |
 | FFN dimension | 512 |
-| Vocabulary | 8,000 joint BPE tokens (shared EN+VI) |
+| Vocabulary | 8,000 joint SentencePiece Unigram tokens (shared EN+VI) |
 | Embeddings | shared across encoder input, decoder input, and output projection |
 | Position encoding | sinusoidal (0 extra parameters) |
 | Dropout | 0.1 |
@@ -28,7 +28,7 @@ report.
 ## 0. Repository layout
 
 ```
-tokenizer.py            # denoising rules, noise augmentation, BPE subword tokenizer
+tokenizer.py            # denoising rules, noise augmentation, SentencePiece Unigram tokenizer
 preprocess.py           # STEP 1 — writes a fully denoised copy of the corpus
 data.py                 # loads data (raw or preprocessed) into DataLoaders
 eval_utils.py           # shared fair-comparison eval subset (used by baseline.py AND test.py)
@@ -142,9 +142,9 @@ python train.py --data_dir ./en-vi-translation-data --epochs 20
 
 What it does:
 - Loads `output/clean_data/` if present (else raw + on-the-fly clean).
-- Trains **one shared BPE vocabulary** (default 8000 tokens) over the
+- Trains **one shared SentencePiece Unigram vocabulary** (default 8000 tokens) over the
   concatenation of cleaned English + Vietnamese training text
-  (`output/tokenizers/joint_bpe.json`), used by both the encoder and
+  (`output/tokenizers/joint_spm.model`), used by both the encoder and
   decoder (see the architecture table above).
 - Packs each pair as `encoder_ids = <sos> <toXX> src... <eos>` /
   `decoder_input = <sos> trg...` / `decoder_target = trg... <eos>` — a
@@ -169,11 +169,23 @@ What it does:
   the SAME encoder+decoder pair can later score how well a candidate
   translation reverses back to the noisy source — this is what powers the
   reverse-model term in `rerank.py`.
-- **Source-noise augmentation**: by default (`--augment_noise`, on by
-  default) the English source is further corrupted at train time
-  (keyboard-adjacent typos, dropped characters, random casing) via
-  `tokenizer.augment_noise`, resampled every epoch — usually matters more
-  for robustness than changing the decoding algorithm.
+- **Source-noise augmentation** (`--augment_mode`, default `char`): the
+  English source is further corrupted at train time, resampled every
+  epoch — `char` (keyboard-adjacent typos, dropped characters, random
+  casing, via `tokenizer.augment_noise`), `word` (join/swap/delete/
+  garbage/unk — mirrors the assignment's actual noise types at the word
+  level, via `tokenizer.augment_noise_word_level`), `both`, or `none`.
+  Usually matters more for robustness than changing the decoding algorithm.
+- **Subword regularization** (`--subword_regularization`, off by default):
+  samples a random (still-valid) SentencePiece Unigram segmentation per
+  training access instead of the single deterministic best split — an
+  extra axis of segmentation-level robustness.
+- **Length-bucketed batching** (`--max_tokens_per_batch`, off/fixed-size
+  by default): if set, batches are built by a token-budget (via
+  `LengthBucketBatchSampler`) instead of a fixed example count, cutting
+  padding waste.
+- **Early stopping** (`--early_stopping_patience`, off by default): stops
+  training once val loss hasn't meaningfully improved for that many epochs.
 - Saves the best (lowest val-loss) checkpoint to `output/checkpoint.pt`
   and the train/val loss curve to `output/loss_curve.png` after every
   epoch that improves. Also keeps a rolling window of the last
@@ -185,17 +197,20 @@ Useful flags (all optional, see `python train.py --help`):
 |---|---|---|
 | `--epochs` | 20 | training epochs |
 | `--max_train_samples` | 30000 | cap on training pairs (speed knob) |
-| `--vocab_size` | 8000 | shared BPE vocab size |
+| `--vocab_size` | 8000 | shared SentencePiece vocab size |
 | `--d_model` / `--nhead` | 128 / 4 | model width / attention heads |
 | `--num_encoder_layers` / `--num_decoder_layers` | 3 / 3 | depth — tune these (and `--d_model`/`--d_ff`) to move the parameter count |
 | `--d_ff` | 512 | feedforward dimension |
-| `--batch_size` | 64 | |
+| `--batch_size` | 64 | also the max example count per batch under `--max_tokens_per_batch` |
 | `--lr_schedule` | `noam` | `noam` (warmup+decay, recommended) or `plateau` (old behavior) |
 | `--lr` | 1.0 | Noam scale multiplier (peak lr ≈1.4e-3 at defaults); flat LR if `--lr_schedule plateau` |
 | `--warmup_steps` | 4000 | Noam warmup length in optimizer steps |
 | `--max_len` | 128 | max encoder/decoder sequence length |
 | `--p_reverse` | 0.3 | fraction of examples trained VI→EN (bidirectional model) |
-| `--augment_noise` / `--no_augment_noise` | on | train-time source noise augmentation |
+| `--augment_mode` | `char` | `none` / `char` / `word` / `both` train-time source noise augmentation |
+| `--subword_regularization` | off | stochastic Unigram segmentation at train time |
+| `--max_tokens_per_batch` | off | token-budget bucketed batching instead of fixed-size |
+| `--early_stopping_patience` | 0 (off) | stop after N epochs with no meaningful val-loss improvement |
 | `--save_last_k` | 3 | epoch checkpoints kept in `output/ckpts/` for averaging |
 | `--output_dir` | `./output` | where everything gets written |
 
@@ -272,7 +287,7 @@ output/
     val_clean.en.txt    val_clean.vi.txt
     test_clean.en.txt   test_clean.vi.txt
   preprocess_stats.json          # noise-fix/deletion counts per split
-  tokenizers/joint_bpe.json      # shared BPE vocabulary
+  tokenizers/joint_spm.model     # shared SentencePiece vocabulary
   denoise_stats.json             # clean_text-level stats (conservative pass)
   checkpoint.pt                  # best model weights + full config + loss history
   ckpts/epoch_*.pt               # rolling checkpoints for averaging
@@ -292,14 +307,17 @@ Everything needed for the report's plots/tables comes from this folder.
 Beyond plain greedy/beam decoding, `rerank.py` implements a
 "generate many, then pick the best one" strategy:
 
-1. **Generate candidates**: a k-best beam search pool
+1. **Generate candidates**: a k-best **batched** beam search pool
    (`model.beam_search_candidates`, `--n_beam`, default 15) plus several
    low-temperature top-k sampling draws
    (`model.sample_generate`, `--n_sample`, default 10, `--temperature`)
    — beam search alone tends toward near-duplicate high-probability
    hypotheses, sampling fills in genuinely different ones. The encoder
-   runs ONCE per source sentence and its output is reused across every
-   candidate.
+   runs ONCE per source sentence, and all beams are decoded together as
+   one batched forward pass per step (not a Python loop per beam) —
+   finished beams are frozen in place (forced `<eos>` at zero extra cost)
+   so every step stays a fixed-shape batched op, the standard trick for
+   batched beam search without variable-width tensors.
 2. **Filter malformed candidates** (`filter_malformed`): missing `<eos>`
    within the generation budget, leaked special tokens, degenerate/empty
    output, excessive repeated n-grams.
@@ -329,8 +347,8 @@ Beyond plain greedy/beam decoding, `rerank.py` implements a
    one-off decoding artifact that happened to score well.
 
 Two more BLEU-relevant strategies live outside `rerank.py` itself:
-- **Source-noise augmentation** (`tokenizer.augment_noise`, `train.py`
-  `--augment_noise`) — usually matters more than the decoding algorithm.
+- **Source-noise augmentation** (`train.py`'s `--augment_mode`) — usually
+  matters more than the decoding algorithm.
 - **Checkpoint averaging** (`average_checkpoints.py`) — free BLEU, zero
   extra inference-time parameters.
 
@@ -342,7 +360,7 @@ Two more BLEU-relevant strategies live outside `rerank.py` itself:
 table at the top of this README:
 - Bidirectional encoder self-attention over the (denoised) noisy source;
   causal decoder self-attention + cross-attention into the encoder output.
-- **One** shared token embedding (joint EN/VI BPE vocab), used for the
+- **One** shared token embedding (joint EN/VI SentencePiece vocab), used for the
   encoder input, the decoder input, AND (weight-tied) the output
   projection — instead of three separate tables.
 - A leading `<toen>`/`<tovi>` direction tag on the encoder input makes
